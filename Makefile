@@ -1,4 +1,4 @@
-.PHONY: up down logs health topic-create topic-describe
+.PHONY: up down logs health topics-apply topic-create topic-describe
 
 up:
 	docker compose up -d
@@ -12,8 +12,10 @@ logs:
 health:
 	bash scripts/healthcheck.sh
 
-topic-create:
-	docker compose exec -T kafka kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic transactions.raw --partitions 6 --replication-factor 1
+topics-apply:
+	bash scripts/apply-topics.sh infrastructure/kafka/topics.yml
+
+topic-create: topics-apply
 
 topic-describe:
 	docker compose exec -T kafka kafka-topics --bootstrap-server kafka:29092 --describe --topic transactions.raw

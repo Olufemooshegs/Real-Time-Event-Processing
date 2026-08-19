@@ -101,8 +101,40 @@ Mitigations to weigh, not yet decided:
 - Accepting the skew as realistic (real user populations are Zipfian anyway) and treating
   partition-level throughput headroom, not perfect balance, as the actual design target.
 
-No decision made yet on which mitigation to apply, if any — this is being carried forward
-as a documented, measured risk rather than resolved prematurely.
+At the end of Step 2, no mitigation decision had yet been made. The measured risk was carried
+forward rather than resolved prematurely; the Step 3 decision is recorded below.
+
+### Declarative topic configuration (Step 3)
+
+All topic definitions now live in `infrastructure/kafka/topics.yml`, a reviewable YAML manifest
+applied idempotently with `make topics-apply`. YAML is used instead of JSON so operational
+comments remain next to the settings they explain. The apply script creates missing topics,
+reconciles mutable topic settings, and only increases a partition count when required; it never
+deletes and recreates topics. This specifically avoids the Step 2 deletion race where an
+immediate delete-and-recreate silently left `transactions.raw` with the wrong partition count.
+
+| Topic | Partitions | Replication factor | Retention | Compression | Rationale |
+|---|---:|---:|---|---|---|
+| `transactions.raw` | 6 | 1 | 48 hours | snappy | Allows short development replay without presenting the broker as an archive. |
+| `transactions.deadletter` | 6 | 1 | 14 days | snappy | Lower-volume validation evidence remains available after raw input expires. |
+| `transactions.late` | 6 | 1 | 14 days | snappy | Preserves late-event evidence for later watermark and allowed-lateness analysis. |
+| `analytics.aggregates` | 6 | 1 | 7 days | snappy | Gives future downstream consumers a bounded catch-up and replay window. |
+
+All four topics use `cleanup.policy=delete` and `min.insync.replicas=1`. The latter is necessary
+for the single-broker development cluster and does not close the documented replication-factor-1
+production gap.
+
+### Hot-key mitigation decision (Step 3)
+
+**Approved decision:** future producer work will generate non-sequential user IDs in the format
+`usr_<16 random lowercase hex characters>`, for example `usr_7fa31c94b0de128a`. This preserves a
+short, recognizable prefix for logs and debugging while providing a high-entropy key space for
+Kafka's default murmur2 partitioner. It directly removes the measured source of artificial
+partition skew: the narrow, sequential, zero-padded numeric suffixes of the current IDs.
+
+This is a dedicated follow-up to Step 2, not a retroactive change to the verified producer in
+this step. The existing user-distribution controls remain useful for intentionally generating
+realistic hot users after the ID-shape artifact is removed.
 
 ### Other settings (initial values, to be tuned against Step 12 benchmarks)
 
