@@ -48,6 +48,64 @@ services:
       retries: 6
       start_period: 10s
 
+  jobmanager:
+    build:
+      context: ./flink
+    image: real-time-flink:1.19.3
+    container_name: real-time-flink-jobmanager
+    command: jobmanager
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        jobmanager.memory.process.size: 512m
+        parallelism.default: 2
+        execution.checkpointing.interval: 10 s
+        execution.checkpointing.mode: EXACTLY_ONCE
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        state.savepoints.dir: file:///opt/flink/savepoints
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+      - flink-savepoints:/opt/flink/savepoints
+    depends_on:
+      kafka:
+        condition: service_healthy
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://localhost:8081/overview >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  taskmanager:
+    image: real-time-flink:1.19.3
+    container_name: real-time-flink-taskmanager
+    command: taskmanager
+    restart: unless-stopped
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: jobmanager
+        taskmanager.memory.process.size: 1536m
+        taskmanager.memory.managed.size: 256m
+        taskmanager.numberOfTaskSlots: 2
+        parallelism.default: 2
+        execution.checkpointing.interval: 10 s
+        execution.checkpointing.mode: EXACTLY_ONCE
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        state.savepoints.dir: file:///opt/flink/savepoints
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+      - flink-savepoints:/opt/flink/savepoints
+    depends_on:
+      jobmanager:
+        condition: service_healthy
+    mem_limit: 1536m
+
 volumes:
   kafka-data:
   postgres-data:
+  flink-checkpoints:
+  flink-savepoints:
