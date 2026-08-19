@@ -56,7 +56,7 @@ for topic in $topic_names; do
     --topic "$topic" --partitions "$partitions" --replication-factor "$replication_factor"
 
   description=$(kafka_exec kafka-topics --bootstrap-server kafka:29092 --describe --topic "$topic")
-  current_partitions=$(sed -n 's/.*PartitionCount:\([0-9][0-9]*\).*/\1/p' <<<"$description" | head -n 1)
+  current_partitions=$(sed -n 's/.*PartitionCount:[[:space:]]*\([0-9][0-9]*\).*/\1/p' <<<"$description" | head -n 1)
   if [[ -z "$current_partitions" ]]; then
     printf 'ERROR: Could not read partition count for %s\n' "$topic" >&2
     exit 1
