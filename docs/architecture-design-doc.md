@@ -79,6 +79,31 @@ effective throughput regardless of total partition count. The load generator's "
 distribution" config (Step 2) should include a skewed-distribution mode specifically so this
 can be provoked and measured, not just theorized about.
 
+**Empirical finding (Step 2 verification, 2026-08-19):** this risk showed up even under
+nominal *uniform* user distribution, not only under deliberately skewed mode. With a ~600-,
+1000-distinct-user pool of sequential, zero-padded IDs (`usr_00001` style) and `acks=all` /
+`enable.idempotence=true` / murmur2 default partitioning via `aiokafka`, a sample of 2,000
+published events left 2 of 6 partitions with zero traffic, and partition-level counts ranged
+roughly 3x between the busiest and quietest active partitions. The producer's send-side code
+(key encoding, no custom partitioner, correct `AIOKafkaProducer` config) was checked directly
+and ruled out as the cause — this is default murmur2 hash behavior on a narrow, structured
+key space, not a bug.
+
+Practical implication: hot-partition skew is not purely a function of real-world user
+behavior (a few power users) — it can also emerge from the *shape* of the ID space itself
+(sequential, zero-padded, narrow numeric range) independent of any intentional skew setting.
+Mitigations to weigh, not yet decided:
+- Larger user pool size, which increases key diversity and should improve hash spread
+  (hypothesis not yet confirmed against real data — a follow-up run at higher pool size
+  is a reasonable next check).
+- Non-sequential ID generation (e.g. UUID-based `user_id` instead of zero-padded sequential),
+  trading human-readability for better hash distribution.
+- Accepting the skew as realistic (real user populations are Zipfian anyway) and treating
+  partition-level throughput headroom, not perfect balance, as the actual design target.
+
+No decision made yet on which mitigation to apply, if any — this is being carried forward
+as a documented, measured risk rather than resolved prematurely.
+
 ### Other settings (initial values, to be tuned against Step 12 benchmarks)
 
 - **Partition count:** start at 6 for `transactions.raw` — enough to parallelize across a
@@ -143,6 +168,27 @@ These two numbers directly trade off latency (how soon can we emit a "final" agg
 completeness (how many legitimately late events get included). The producer's own configurable
 delay/out-of-order settings (Step 2) exist specifically so this tradeoff can be tuned against
 observed data rather than picked arbitrarily.
+
+**Empirical finding (Step 2 verification, 2026-08-19):** late events and within-partition
+out-of-order events are two distinct phenomena at very different scales, confirmed separately
+against real producer output rather than assumed to behave similarly:
+
+- **Late events** (`event_time` trailing `ingest_time`): observed delays up to ~28 seconds in
+  a single sample run. This is the number the *allowed lateness* window needs to account for.
+- **Within-partition out-of-order events** (two adjacent messages on the same partition whose
+  `event_time` values are inverted relative to arrival order): observed inversions on the
+  order of ~20ms in a sample run with `--out-of-order-rate 0.15`. This is a much smaller-scale
+  phenomenon than late events, and is the number the *out-of-orderness bound* (the watermark's
+  trailing offset) needs to account for.
+
+Practical implication: these two numbers should not be conflated or derived from a single
+"lateness" setting. A watermark bound sized to cover 28-second late events would be far more
+conservative (and add far more latency to window emission) than what's actually needed to
+handle the millisecond-scale reordering seen within a partition. The allowed-lateness window
+downstream of the watermark is the more appropriate mechanism for handling the rare large-delay
+late event; the watermark's own out-of-orderness bound should be sized closer to the smaller,
+more common jitter scale. Exact values still to be picked in Step 5, now against real
+measured ranges rather than placeholders.
 
 ### Windowing
 
