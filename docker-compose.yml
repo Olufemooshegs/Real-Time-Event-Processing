@@ -22,11 +22,11 @@ services:
     volumes:
       - kafka-data:/var/lib/kafka/data
     healthcheck:
-      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:29092 --list >/dev/null 2>&1"]
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server kafka:29092 --list >/dev/null 2>&1"]
       interval: 10s
-      timeout: 5s
+      timeout: 15s
       retries: 12
-      start_period: 20s
+      start_period: 30s
 
   postgres:
     image: postgres:16-alpine
@@ -60,9 +60,9 @@ services:
     environment:
       FLINK_PROPERTIES: |
         jobmanager.rpc.address: jobmanager
-        jobmanager.memory.process.size: 512m
+        jobmanager.memory.process.size: 1024m
         parallelism.default: 2
-        execution.checkpointing.interval: 10 s
+        execution.checkpointing.interval: 10s
         execution.checkpointing.mode: EXACTLY_ONCE
         state.checkpoints.dir: file:///opt/flink/checkpoints
         state.savepoints.dir: file:///opt/flink/savepoints
@@ -72,15 +72,17 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-    mem_limit: 512m
+    mem_limit: 1200m
     healthcheck:
-      test: ["CMD-SHELL", "curl --fail --silent http://localhost:8081/overview >/dev/null"]
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/8081' || exit 1"]
+      timeout: 15s
       interval: 10s
-      timeout: 5s
       retries: 12
-      start_period: 20s
+      start_period: 30s
 
   taskmanager:
+    build:
+      context: ./flink
     image: real-time-flink:1.19.3
     container_name: real-time-flink-taskmanager
     command: taskmanager
@@ -92,7 +94,7 @@ services:
         taskmanager.memory.managed.size: 256m
         taskmanager.numberOfTaskSlots: 2
         parallelism.default: 2
-        execution.checkpointing.interval: 10 s
+        execution.checkpointing.interval: 10s
         execution.checkpointing.mode: EXACTLY_ONCE
         state.checkpoints.dir: file:///opt/flink/checkpoints
         state.savepoints.dir: file:///opt/flink/savepoints
@@ -103,6 +105,12 @@ services:
       jobmanager:
         condition: service_healthy
     mem_limit: 1536m
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f TaskManagerRunner"]
+      timeout: 15s
+      interval: 10s
+      retries: 12
+      start_period: 30s
 
 volumes:
   kafka-data:
