@@ -7,6 +7,7 @@ import json
 from typing import Any, Iterator
 
 from pyflink.common import Types
+from pyflink.datastream import FileSystemCheckpointStorage
 from pyflink.common.serialization import SimpleStringSchema
 from pyflink.common.time import Time
 from pyflink.datastream import CheckpointingMode, OutputTag, StreamExecutionEnvironment
@@ -19,7 +20,7 @@ from pyflink.datastream.connectors.kafka import (
 from pyflink.datastream.connectors.base import DeliveryGuarantee
 from pyflink.datastream.functions import KeyedProcessFunction, ProcessFunction
 from pyflink.datastream.state import StateTtlConfig, ValueStateDescriptor
-from pyflink.datastream.watermark_strategy import WatermarkStrategy
+from pyflink.common import WatermarkStrategy
 
 
 REQUIRED_FIELDS: dict[str, type] = {
@@ -76,8 +77,11 @@ class StructuralValidationProcessFunction(ProcessFunction):
             deadletter = json.dumps(
                 {"reason_code": reason, "raw_record": value}, separators=(",", ":")
             )
-            print(f"DEADLETTERED reason={reason}", flush=True)
-            ctx.output(self.deadletter_tag, deadletter)
+            print(f"DEADLETTERED reason={reason}")
+            # PyFlink's Python ProcessFunction API does not expose ctx.output(tag, value)
+            # the way the Java API does. Side outputs are emitted by yielding a
+            # (OutputTag, value) tuple alongside normal yields.
+            yield self.deadletter_tag, deadletter
             return
 
         # Negative amounts, unknown currencies, and unknown transaction types are semantic
@@ -102,11 +106,11 @@ class DeduplicateByEventId(KeyedProcessFunction):
     def process_element(self, value: str, ctx: KeyedProcessFunction.Context) -> Iterator[str]:
         event = json.loads(value)
         if self.seen.value():
-            print(f"DEDUPLICATED_DROP event_id={event['event_id']}", flush=True)
+            print(f"DEDUPLICATED_DROP event_id={event['event_id']}")
             return
 
         self.seen.update(True)
-        print(f"VALIDATED_PASS event_id={event['event_id']}", flush=True)
+        print(f"VALIDATED_PASS event_id={event['event_id']}")
         yield value
 
 
@@ -132,7 +136,7 @@ def main() -> None:
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_parallelism(2)
     env.enable_checkpointing(10_000, CheckpointingMode.EXACTLY_ONCE)
-    env.get_checkpoint_config().set_checkpoint_storage("file:///opt/flink/checkpoints")
+    env.get_checkpoint_config().set_checkpoint_storage(FileSystemCheckpointStorage("file:///opt/flink/checkpoints"))
 
     source = (
         KafkaSource.builder()
