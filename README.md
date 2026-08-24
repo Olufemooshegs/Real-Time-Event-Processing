@@ -1,6 +1,6 @@
 # Real-Time Event Processing & Analytics Platform
 
-Status: **in progress — Step 2 of 12 complete, moving to Step 3 (see docs/architecture-design-doc.md for the full plan)**
+Status: **in progress — Step 4 of 12 complete, moving to Step 5 (see docs/architecture-design-doc.md for the full plan)**
 
 This README is updated after each step with what's actually running and verified, not what's
 planned. If something isn't listed under "What's running" below, it doesn't exist yet.
@@ -92,7 +92,85 @@ Simpler single-broker dev setup. No operational reason to introduce Zookeeper at
 
 ---
 
-## How to run it
+### Step 3 — Kafka topic hardening & formal configuration (closed)
+- Topic definitions moved from ad-hoc CLI commands to declarative config
+  (`infrastructure/kafka/topics.yml`), covering all four topics from the design doc:
+  `transactions.raw`, `transactions.deadletter`, `transactions.late`,
+  `analytics.aggregates`.
+- `scripts/apply-topics.sh` (via `make topics-apply`) creates/reconciles all four topics
+  idempotently. Confirmed via real re-run: second execution reported `OK:` for every
+  topic (not `Created topic`), no errors, no unintended changes.
+- A partition-count parsing bug was found and fixed during verification: the script's
+  `sed` pattern expected `PartitionCount:6` (no space) but Kafka's actual `--describe`
+  output is `PartitionCount: 6` (with a space), causing every run to fail immediately
+  after processing the first topic. Fixed by tolerating optional whitespace in the pattern.
+- All four topics confirmed via `kafka-configs --describe` to match the manifest exactly:
+  - `transactions.raw`: 6 partitions, RF 1, retention 48h (172800000ms), snappy
+  - `transactions.deadletter`: 6 partitions, RF 1, retention 14d (1209600000ms), snappy
+  - `transactions.late`: 6 partitions, RF 1, retention 14d (1209600000ms), snappy
+  - `analytics.aggregates`: 6 partitions, RF 1, retention 7d (604800000ms), snappy
+- Hot-key mitigation decided: switch to non-sequential `user_id` generation (format —
+  full UUID vs. partial-readability suffix — still to be finalized), as a dedicated
+  follow-up step. Not applied to the Step 2 producer in this step, to avoid silently
+  modifying already-verified code.
+
+### Step 4 — Minimal Flink job: validation, dedup (closed)
+- Flink cluster (JobManager + TaskManager, single TaskManager, 2 slots) added to
+  docker-compose.yml, memory sized deliberately (jobmanager 1024m process size / 1200m
+  container limit, taskmanager 1536m / 1536m) after the default 512m proved mathematically
+  insufficient for Flink's own JVM overhead + off-heap accounting.
+- PyFlink job (`flink/jobs/validation_dedup_job.py`) consumes `transactions.raw`, performs
+  structural validation only (JSON shape and field types — semantic rules like negative
+  amounts deliberately pass through, per design, and are deferred to Step 6), routes
+  structural failures to `transactions.deadletter` with a reason code, and deduplicates
+  valid events by `event_id` using keyed state with a 10-minute TTL.
+- Confirmed via the durable dead-letter topic (not just print logs): 134 dead-lettered
+  records across a full test run, spanning 5 correct reason codes (`invalid_type:amount`,
+  `missing_field:amount`, `missing_field:currency`, `missing_field:event_time`,
+  `missing_field:merchant_id`).
+- Dedup confirmed via log counts tracking sensibly against producer-reported duplicates
+  (42 DEDUPLICATED_DROP vs 49 duplicates injected; gap explained by duplicate events that
+  were also structurally malformed and dead-lettered before reaching the dedup stage).
+- Checkpointing enabled (10s interval, EXACTLY_ONCE mode, durable file-based storage);
+  job sustained continuous RUNNING state across multiple verification runs.
+
+**Nine distinct, unrelated bug classes were found and fixed to get here** — worth recording
+plainly, since this step took far longer than Steps 1-3 combined and each issue would have
+been costly to rediscover blind in a later step:
+1. `taskmanager` service missing its own `build:` block in docker-compose.yml (was trying
+   to pull a nonexistent public image instead of building locally).
+2. Kafka's healthcheck tested `localhost:29092` instead of `kafka:29092` — passed manually
+   the whole time, never passed automated health checks, because the internal listener is
+   bound to the `kafka` hostname, not loopback.
+3. Kafka's healthcheck timeout (5s) too tight for a cold JVM CLI invocation
+   (`kafka-topics`) — not a resource problem, just inherent JVM startup cost.
+4. Two near-identical healthcheck blocks in the compose file (Kafka's and JobManager's)
+   caused repeated edits to land on the wrong block during debugging.
+5. JobManager's `jobmanager.memory.process.size: 512m` was mathematically too small —
+   Flink's own JVM overhead minimum (192MB) plus default off-heap requirement (128MB)
+   couldn't fit in 512MB total.
+6. `curl` was listed in the Dockerfile's install step but wasn't actually present in the
+   built image at runtime — broke both Flink healthchecks until switched to
+   dependency-free checks (`bash`'s `/dev/tcp`, `pgrep`).
+7. PyFlink job submission requires the Python interpreter path explicitly
+   (`-pyclientexec`, `-pyexec`) since the image only has `python3`, not a plain `python`
+   binary on PATH.
+8. `flink-connector-kafka` (thin JAR) was used instead of `flink-sql-connector-kafka`
+   (shaded/fat JAR) — the thin connector doesn't bundle Kafka's client library, causing a
+   `NoClassDefFoundError` at Kafka source construction.
+9. The `flink-checkpoints`/`flink-savepoints` named Docker volumes were owned by root by
+   default while the container runs as the `flink` user — job startup failed until
+   ownership was corrected.
+10. PyFlink API mismatches specific to this installed version (1.19.3): `WatermarkStrategy`
+    lives at `pyflink.common`, not `pyflink.datastream.watermark_strategy`;
+    `set_checkpoint_storage()` requires a `FileSystemCheckpointStorage` object, not a raw
+    path string; `print(..., flush=True)` isn't supported by PyFlink's `CustomPrint`; and
+    side outputs are emitted by yielding an `(OutputTag, value)` tuple, not calling
+    `ctx.output(tag, value)` as the Java API allows.
+
+Any file edit under `flink/jobs/` requires `docker compose build jobmanager taskmanager`
+before it takes effect — the job file is baked into the image at build time, not mounted
+live. This was rediscovered the hard way more than once during this step.
 
 ```
 cp .env.example .env
