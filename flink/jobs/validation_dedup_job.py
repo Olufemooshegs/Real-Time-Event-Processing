@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
-from typing import Any, Iterator
+from datetime import datetime
+from typing import Any, Iterable, Iterator
 
-from pyflink.common import Types
+from pyflink.common import Duration, TimestampAssigner, Types, WatermarkStrategy
 from pyflink.datastream import FileSystemCheckpointStorage
 from pyflink.common.serialization import SimpleStringSchema
 from pyflink.common.time import Time
@@ -18,9 +19,14 @@ from pyflink.datastream.connectors.kafka import (
     KafkaSource,
 )
 from pyflink.datastream.connectors.base import DeliveryGuarantee
-from pyflink.datastream.functions import KeyedProcessFunction, ProcessFunction
+from pyflink.datastream.functions import (
+    AggregateFunction,
+    KeyedProcessFunction,
+    ProcessFunction,
+    ProcessWindowFunction,
+)
 from pyflink.datastream.state import StateTtlConfig, ValueStateDescriptor
-from pyflink.common import WatermarkStrategy
+from pyflink.datastream.window import TumblingEventTimeWindows
 
 
 REQUIRED_FIELDS: dict[str, type] = {
@@ -41,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bootstrap-servers", default="kafka:29092")
     parser.add_argument("--source-topic", default="transactions.raw")
     parser.add_argument("--deadletter-topic", default="transactions.deadletter")
+    parser.add_argument("--late-topic", default="transactions.late")
     parser.add_argument("--consumer-group", default="flink-validation-dedup-v1")
     return parser.parse_args()
 
@@ -114,6 +121,54 @@ class DeduplicateByEventId(KeyedProcessFunction):
         yield value
 
 
+class EventTimeAssigner(TimestampAssigner):
+    """Assign the producer's ISO-8601 event_time rather than Kafka arrival time."""
+
+    def extract_timestamp(self, value: str, record_timestamp: int) -> int:
+        event_time = json.loads(value)["event_time"]
+        return int(datetime.fromisoformat(event_time.replace("Z", "+00:00")).timestamp() * 1000)
+
+
+class TransactionAggregate(AggregateFunction):
+    """Incrementally maintain count and minor-unit volume for each user/window."""
+
+    def create_accumulator(self) -> tuple[int, int]:
+        return 0, 0
+
+    def add(self, value: str, accumulator: tuple[int, int]) -> tuple[int, int]:
+        amount = json.loads(value)["amount"]
+        return accumulator[0] + 1, accumulator[1] + amount
+
+    def get_result(self, accumulator: tuple[int, int]) -> tuple[int, int]:
+        return accumulator
+
+    def merge(
+        self, first: tuple[int, int], second: tuple[int, int]
+    ) -> tuple[int, int]:
+        return first[0] + second[0], first[1] + second[1]
+
+
+class FormatUserWindowAggregate(ProcessWindowFunction):
+    """Attach user and event-time window bounds to the incremental aggregate."""
+
+    def process(
+        self,
+        key: str,
+        context: ProcessWindowFunction.Context,
+        elements: Iterable[tuple[int, int]],
+    ) -> Iterator[str]:
+        count, total_volume = next(iter(elements))
+        result = {
+            "user_id": key,
+            "window_start": context.window().start,
+            "window_end": context.window().end,
+            "transaction_count": count,
+            "total_volume": total_volume,
+            "average_transaction_value": total_volume / count,
+        }
+        yield json.dumps(result, separators=(",", ":"))
+
+
 def build_deadletter_sink(bootstrap_servers: str, topic: str) -> KafkaSink:
     serializer = (
         KafkaRecordSerializationSchema.builder()
@@ -126,6 +181,23 @@ def build_deadletter_sink(bootstrap_servers: str, topic: str) -> KafkaSink:
         .set_bootstrap_servers(bootstrap_servers)
         .set_record_serializer(serializer)
         # Dead letters are diagnostic output. Duplicate diagnostics are acceptable here.
+        .set_delivery_guarantee(DeliveryGuarantee.AT_LEAST_ONCE)
+        .build()
+    )
+
+
+def build_diagnostic_sink(bootstrap_servers: str, topic: str) -> KafkaSink:
+    """Route diagnostic streams to Kafka; at-least-once is sufficient for diagnostics."""
+    serializer = (
+        KafkaRecordSerializationSchema.builder()
+        .set_topic(topic)
+        .set_value_serialization_schema(SimpleStringSchema())
+        .build()
+    )
+    return (
+        KafkaSink.builder()
+        .set_bootstrap_servers(bootstrap_servers)
+        .set_record_serializer(serializer)
         .set_delivery_guarantee(DeliveryGuarantee.AT_LEAST_ONCE)
         .build()
     )
@@ -147,9 +219,7 @@ def main() -> None:
         .set_value_only_deserializer(SimpleStringSchema())
         .build()
     )
-    raw_events = env.from_source(
-        source, WatermarkStrategy.no_watermarks(), "transactions.raw source"
-    )
+    raw_events = env.from_source(source, WatermarkStrategy.no_watermarks(), "transactions.raw source")
 
     deadletter_tag = OutputTag("structural-deadletter", Types.STRING())
     validated = raw_events.process(
@@ -162,13 +232,55 @@ def main() -> None:
         lambda value: json.loads(value)["event_id"], key_type=Types.STRING()
     ).process(DeduplicateByEventId(), output_type=Types.STRING())
 
-    # Step 4 intentionally has no durable valid-event sink. This stdout sink is the manual
-    # verification surface until Step 7 adds the Postgres and aggregate Kafka sinks.
+    # Step 2 observed ~20 ms within-partition inversions. A 50 ms bound (2.5x that measured
+    # scale) absorbs normal ordering jitter without delaying event-time progress by seconds.
+    # The 30 s idleness timeout prevents quiet Kafka partitions, likely under known key skew,
+    # from indefinitely holding back this source's watermark.
+    event_time_events = deduplicated.assign_timestamps_and_watermarks(
+        WatermarkStrategy.for_bounded_out_of_orderness(Duration.of_millis(50))
+        .with_timestamp_assigner(EventTimeAssigner())
+        .with_idleness(Duration.of_seconds(30))
+    )
+
+    late_event_tag = OutputTag("events-past-allowed-lateness", Types.STRING())
+    # Step 2 observed late arrival up to ~28 s, distinct from the ~20 ms in-order jitter above.
+    # 45 s provides measured headroom while deliberately remaining far larger than the 50 ms
+    # watermark bound: allowed lateness retains an already-closed window for late updates.
+    user_windows = (
+        event_time_events.key_by(
+            lambda value: json.loads(value)["user_id"], key_type=Types.STRING()
+        )
+        .window(TumblingEventTimeWindows.of(Time.seconds(10)))
+        .allowed_lateness(Time.seconds(45))
+        .side_output_late_data(late_event_tag)
+    )
+    aggregates = user_windows.aggregate(
+        TransactionAggregate(),
+        FormatUserWindowAggregate(),
+        accumulator_type=Types.TUPLE([Types.LONG(), Types.LONG()]),
+        output_type=Types.STRING(),
+    )
+
+    # WindowedStream.side_output_late_data captures records dropped only after watermark >
+    # window end + allowed lateness. Preserve the original validated/deduplicated payload in
+    # transactions.late instead of silently discarding it.
+    late_events = aggregates.get_side_output(late_event_tag)
+    late_events.sink_to(build_diagnostic_sink(args.bootstrap_servers, args.late_topic))
+    late_events.map(
+        lambda value: f"LATE_EVENT_OUTPUT {value}", output_type=Types.STRING()
+    ).print()
+
+    # Step 5 has no durable aggregate sink. Stdout is the inspection surface until Step 7.
+    aggregates.map(
+        lambda value: f"USER_WINDOW_AGGREGATE {value}", output_type=Types.STRING()
+    ).print()
+
+    # Keep the existing Step 4 per-record verification output additive to windowing.
     deduplicated.map(
         lambda value: f"VALIDATED_PASS_OUTPUT {value}", output_type=Types.STRING()
     ).print()
 
-    env.execute("step-4-validation-and-deduplication")
+    env.execute("step-5-event-time-validation-and-deduplication")
 
 
 if __name__ == "__main__":
