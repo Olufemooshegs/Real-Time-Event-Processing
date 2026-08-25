@@ -7,7 +7,8 @@ import json
 from datetime import datetime
 from typing import Any, Iterable, Iterator
 
-from pyflink.common import Duration, TimestampAssigner, Types, WatermarkStrategy
+from pyflink.common import Duration, Types, WatermarkStrategy
+from pyflink.common.watermark_strategy import TimestampAssigner
 from pyflink.datastream import FileSystemCheckpointStorage
 from pyflink.common.serialization import SimpleStringSchema
 from pyflink.common.time import Time
@@ -203,6 +204,15 @@ def build_diagnostic_sink(bootstrap_servers: str, topic: str) -> KafkaSink:
     )
 
 
+class DebugWatermarkProbe(ProcessFunction):
+    def process_element(self, value, ctx):
+        event = json.loads(value)
+        print(f"DEBUG_PROBE event_id={event['event_id']} "
+              f"element_ts={ctx.timestamp()} "
+              f"current_watermark={ctx.timer_service().current_watermark()}")
+        yield value
+
+
 def main() -> None:
     args = parse_args()
     env = StreamExecutionEnvironment.get_execution_environment()
@@ -241,6 +251,7 @@ def main() -> None:
         .with_timestamp_assigner(EventTimeAssigner())
         .with_idleness(Duration.of_seconds(30))
     )
+    event_time_events = event_time_events.process(DebugWatermarkProbe(), output_type=Types.STRING())
 
     late_event_tag = OutputTag("events-past-allowed-lateness", Types.STRING())
     # Step 2 observed late arrival up to ~28 s, distinct from the ~20 ms in-order jitter above.
@@ -251,15 +262,15 @@ def main() -> None:
             lambda value: json.loads(value)["user_id"], key_type=Types.STRING()
         )
         .window(TumblingEventTimeWindows.of(Time.seconds(10)))
-        .allowed_lateness(Time.seconds(45))
+        .allowed_lateness(45_000)
         .side_output_late_data(late_event_tag)
     )
-    aggregates = user_windows.aggregate(
-        TransactionAggregate(),
-        FormatUserWindowAggregate(),
-        accumulator_type=Types.TUPLE([Types.LONG(), Types.LONG()]),
-        output_type=Types.STRING(),
-    )
+    # TEMPORARY DIAGNOSTIC: swapped aggregate() for reduce() to test whether aggregate()
+    # itself is dropping the late-data side output in this PyFlink version. REVERT AFTER TEST.
+    def _debug_reduce(a, b):
+        ea, eb = json.loads(a), json.loads(b)
+        return a
+    aggregates = user_windows.reduce(_debug_reduce)
 
     # WindowedStream.side_output_late_data captures records dropped only after watermark >
     # window end + allowed lateness. Preserve the original validated/deduplicated payload in
