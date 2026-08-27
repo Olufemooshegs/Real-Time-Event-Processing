@@ -1,4 +1,4 @@
-.PHONY: up down logs health topics-apply topic-create topic-describe flink-up flink-health flink-job-submit flink-logs flink-api-check
+.PHONY: up down logs health topics-apply topic-create topic-describe flink-up flink-health flink-job-submit flink-logs flink-api-check flink-anomaly-api-check
 
 up:
 	docker compose up -d
@@ -43,3 +43,6 @@ flink-logs:
 
 flink-api-check:
 	docker compose exec -T jobmanager python3 -c "from pyflink.common import Duration, WatermarkStrategy; from pyflink.common.watermark_strategy import TimestampAssigner; from pyflink.datastream.data_stream import WindowedStream; from pyflink.datastream.window import TumblingEventTimeWindows; help(WatermarkStrategy.for_bounded_out_of_orderness); help(WatermarkStrategy.with_timestamp_assigner); help(WatermarkStrategy.with_idleness); help(TumblingEventTimeWindows.of); help(WindowedStream.allowed_lateness); help(WindowedStream.side_output_late_data); help(WindowedStream.aggregate); help(TimestampAssigner)"
+
+flink-anomaly-api-check:
+	docker compose exec -T jobmanager python3 -c "from pyflink.common import Types; from pyflink.datastream.functions import KeyedProcessFunction; from pyflink.datastream.state import ValueStateDescriptor; help(KeyedProcessFunction); help(ValueStateDescriptor); help(Types.LIST); help(Types.LONG)"

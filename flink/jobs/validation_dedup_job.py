@@ -1,4 +1,4 @@
-"""Step 5 Flink job: event-time processing, watermarks, allowed lateness, windowed aggregation.
+"""Step 6 Flink job: event-time processing, windows, and deterministic anomalies.
 
 Late-data routing note (found during Step 5 verification):
 PyFlink 1.19.3's WindowedStream.side_output_late_data() did not route late events to the
@@ -67,6 +67,10 @@ REQUIRED_FIELDS: dict[str, type] = {
 # that bound: allowed lateness is about retaining an already-closed window for late updates,
 # not about ordering jitter within a still-open window.
 ALLOWED_LATENESS_MS = 45_000
+VELOCITY_WINDOW_MS = 60_000
+VELOCITY_THRESHOLD = 10
+PERCENTILE_HISTORY_LIMIT = 256
+PERCENTILE_MIN_HISTORY = 20
 
 
 def parse_args() -> argparse.Namespace:
@@ -225,6 +229,75 @@ class FormatUserWindowAggregate(ProcessWindowFunction):
         yield json.dumps(result, separators=(",", ":"))
 
 
+class UserAnomalyDetection(KeyedProcessFunction):
+    """Apply deterministic per-user velocity and amount rules on the on-time stream."""
+
+    def open(self, runtime_context: Any) -> None:
+        self.velocity_timestamps = runtime_context.get_state(
+            ValueStateDescriptor("velocity-event-times", Types.LIST(Types.LONG()))
+        )
+        # A bounded recent history approximates a rolling percentile. Unbounded exact history
+        # would grow state without limit and make checkpoints progressively more expensive.
+        self.amount_history = runtime_context.get_state(
+            ValueStateDescriptor("amount-history", Types.LIST(Types.LONG()))
+        )
+
+    @staticmethod
+    def percentile_99(values: list[int]) -> float:
+        ordered = sorted(values)
+        position = (len(ordered) - 1) * 0.99
+        lower = int(position)
+        upper = min(lower + 1, len(ordered) - 1)
+        fraction = position - lower
+        return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+    def process_element(
+        self, value: str, ctx: KeyedProcessFunction.Context
+    ) -> Iterator[str]:
+        event = json.loads(value)
+        event_ts = int(
+            datetime.fromisoformat(event["event_time"].replace("Z", "+00:00")).timestamp()
+            * 1000
+        )
+
+        timestamps = list(self.velocity_timestamps.value() or [])
+        timestamps = [
+            timestamp for timestamp in timestamps if timestamp >= event_ts - VELOCITY_WINDOW_MS
+        ]
+        timestamps.append(event_ts)
+        self.velocity_timestamps.update(timestamps)
+        if len(timestamps) > VELOCITY_THRESHOLD:
+            yield json.dumps(
+                {
+                    "tag": "ANOMALY_VELOCITY",
+                    "user_id": event["user_id"],
+                    "transaction_count": len(timestamps),
+                    "window_seconds": VELOCITY_WINDOW_MS // 1000,
+                    "threshold": VELOCITY_THRESHOLD,
+                    "event_id": event["event_id"],
+                },
+                separators=(",", ":"),
+            )
+
+        amounts = list(self.amount_history.value() or [])
+        if len(amounts) >= PERCENTILE_MIN_HISTORY:
+            percentile = self.percentile_99(amounts)
+            if event["amount"] > percentile:
+                yield json.dumps(
+                    {
+                        "tag": "ANOMALY_AMOUNT",
+                        "user_id": event["user_id"],
+                        "event_id": event["event_id"],
+                        "amount": event["amount"],
+                        "rolling_99th_percentile": percentile,
+                        "history_size": len(amounts),
+                    },
+                    separators=(",", ":"),
+                )
+        amounts.append(event["amount"])
+        self.amount_history.update(amounts[-PERCENTILE_HISTORY_LIMIT:])
+
+
 def build_deadletter_sink(bootstrap_servers: str, topic: str) -> KafkaSink:
     serializer = (
         KafkaRecordSerializationSchema.builder()
@@ -331,7 +404,14 @@ def main() -> None:
         lambda value: f"VALIDATED_PASS_OUTPUT {value}", output_type=Types.STRING()
     ).print()
 
-    env.execute("step-5-event-time-validation-and-deduplication")
+    anomalies = routed.key_by(
+        lambda value: json.loads(value)["user_id"], key_type=Types.STRING()
+    ).process(UserAnomalyDetection(), output_type=Types.STRING())
+    anomalies.map(
+        lambda value: f"{json.loads(value)['tag']} {value}", output_type=Types.STRING()
+    ).print()
+
+    env.execute("step-6-event-time-validation-deduplication-and-anomalies")
 
 
 if __name__ == "__main__":

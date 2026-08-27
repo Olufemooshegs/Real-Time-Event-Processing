@@ -10,7 +10,13 @@ The job assigns timestamps from the event's ISO-8601 `event_time`, then uses a b
 
 Per-user event-time windows tumble every **10 seconds**. They allow **45 seconds** of lateness. The observed Step 2 late-event delay was about 28 seconds, so 45 seconds preserves a 17-second margin. This is intentionally much larger than the 50 ms watermark bound: the first covers small within-partition ordering jitter, while the latter retains already-closed windows for genuinely late arrivals.
 
-Records arriving after `watermark > window_end + 45 seconds` are captured by the window operator's `side_output_late_data` mechanism and published unchanged to `transactions.late`. They are also logged with `LATE_EVENT_OUTPUT`. Late arrivals within the 45-second allowance update their original window and can produce a revised aggregate output.
+Records arriving after `watermark > window_end + 45 seconds` are routed by the manually verified `LatenessRouter` process function and published unchanged to `transactions.late`. The built-in `WindowedStream.side_output_late_data()` was non-functional in this PyFlink 1.19.3 environment, so it is intentionally not used. Routed records are logged with `LATE_EVENT_OUTPUT`. Late arrivals within the 45-second allowance update their original window and can produce a revised aggregate output.
+
+## Deterministic anomaly rules
+
+The on-time, validated, deduplicated stream now has an additive per-user anomaly branch. Velocity is a rolling **60-second event-time horizon** with a threshold of **more than 10 transactions**. Ten is deliberately low enough to make a one-user burst observable in this development workload while remaining above ordinary low-rate traffic.
+
+Amount anomalies compare each transaction with that user's rolling 99th-percentile historical amount. The estimate uses the most recent **256 amounts per user**, with a **20-amount warm-up** before evaluation. This bounded history is intentionally approximate: an unbounded exact per-user history would grow checkpoint state indefinitely. The branch emits no durable sink yet; it prints `ANOMALY_VELOCITY` or `ANOMALY_AMOUNT` JSON records for Step 6 verification.
 
 ## Start and submit
 
@@ -25,6 +31,8 @@ The JobManager web UI is available at `http://localhost:8081`; `make flink-up` w
 
 Run `make flink-api-check` after rebuilding and before submitting when validating the installed PyFlink 1.19.3 image. It prints the in-container help for every Step 5 API call that is sensitive to PyFlink version: the watermark builder and timestamp assigner, tumbling window constructor, allowed-lateness setup, late-data side output, and incremental aggregate signature.
 
+Run `make flink-anomaly-api-check` as well to inspect the installed keyed-process and value-state APIs used by the anomaly branch (`KeyedProcessFunction`, `ValueStateDescriptor`, `Types.LIST`, and `Types.LONG`).
+
 If `docker compose down -v` recreated the checkpoint or savepoint volumes, restore their ownership before submitting: run `chown -R flink:flink /opt/flink/checkpoints /opt/flink/savepoints` as root in both the JobManager and TaskManager containers. Otherwise checkpointing can fail on a permission error.
 
 The job reads `transactions.raw` with consumer group `flink-validation-dedup-v1`, starting from the earliest offset on its first run. To test it from new data with the existing group, either start the producer after submission or use a new group through the direct `flink run -py` command and `--consumer-group`.
@@ -36,6 +44,8 @@ The job reads `transactions.raw` with consumer group `flink-validation-dedup-v1`
 - `DEDUPLICATED_DROP event_id=...`: a repeated `event_id` was dropped by keyed state.
 - `USER_WINDOW_AGGREGATE {...}`: a per-user 10-second event-time result with count, total minor-unit volume, and average transaction value.
 - `LATE_EVENT_OUTPUT {...}`: a validated, deduplicated record that arrived after the window's 45-second allowed-lateness limit and was routed to `transactions.late`.
+- `ANOMALY_VELOCITY {...}`: a user's event-time transaction count exceeded 10 within 60 seconds.
+- `ANOMALY_AMOUNT {...}`: an amount exceeded that user's estimated rolling 99th percentile after the 20-record warm-up.
 
 The deduplication TTL is 10 minutes. Step 2 verified exact-payload producer retry duplicates, not delayed retries with changed timestamps, so a ten-minute window gives ample retry coverage without retaining event IDs indefinitely. Revisit this TTL if later failure testing demonstrates a longer retry or recovery window.
 
