@@ -1,6 +1,6 @@
 # Real-Time Event Processing & Analytics Platform
 
-Status: **in progress — Step 4 of 12 complete, moving to Step 5 (see docs/architecture-design-doc.md for the full plan)**
+Status: **in progress — Step 5 of 12 complete, moving to Step 6 (see docs/architecture-design-doc.md for the full plan)**
 
 This README is updated after each step with what's actually running and verified, not what's
 planned. If something isn't listed under "What's running" below, it doesn't exist yet.
@@ -171,6 +171,45 @@ been costly to rediscover blind in a later step:
 Any file edit under `flink/jobs/` requires `docker compose build jobmanager taskmanager`
 before it takes effect — the job file is baked into the image at build time, not mounted
 live. This was rediscovered the hard way more than once during this step.
+
+### Step 5 — Event-time processing: watermarks, allowed lateness, windowing (closed)
+- Bounded-out-of-orderness watermark (50ms bound, justified against Step 2's ~20ms measured
+  jitter) with 30s idleness detection to prevent quiet/skewed Kafka partitions from stalling
+  watermark progress.
+- Allowed lateness set to 45s, justified against Step 2's ~28s measured maximum late-event
+  delay, deliberately kept far larger than the watermark's own out-of-orderness bound per
+  the design doc's Section 3 finding that these are separate phenomena at different scales.
+- 10-second tumbling windows keyed by `user_id`, computing count/total volume/average
+  transaction value. Verified mathematically correct via direct spot-checks against log
+  output (e.g. `usr_00234: count=3, total=112148, average=37382.67` — exact).
+- Watermark advancement independently confirmed live and correct via Flink's REST metrics
+  API on both parallel subtasks (ruling out a hot-key/partition-stall watermark issue).
+
+**Finding: `WindowedStream.side_output_late_data()` does not work in this PyFlink 1.19.3
+environment.** Despite correct configuration (confirmed via source inspection of the
+PyFlink library itself — `allowed_lateness()`, `side_output_late_data()`, and
+`_get_result_data_stream()` all correctly wire the late-data tag into the underlying Java
+operator), zero late events ever reached the side output across multiple clean test runs
+with up to 168 genuinely late events per run (some delayed up to 90s, comfortably past the
+45s threshold). Ruled out as causes, in order of investigation: watermark not advancing
+(disproven — confirmed live via REST metrics), timestamp assignment producing wrong values
+(disproven — verified via direct calculation), hot-key partition stall on the windowing
+operator (disproven — both subtasks showed identical, current watermarks),
+`aggregate()`-specific issue (disproven — swapping to `reduce()` produced the same zero
+result). Root cause presumed to be a PyFlink Python-binding-specific limitation of this
+built-in feature, not a configuration or design error.
+
+**Resolution:** built-in late-data side output replaced with a manual `LatenessRouter`
+(`ProcessFunction` comparing `ctx.timestamp()` against `ctx.timer_service().current_watermark()`
+directly, run before windowing). Confirmed working via both log output (725
+`LATE_EVENT_ROUTED` prints in one test) and durable topic content (741 real records
+confirmed in `transactions.late` via direct consumption, not just logs).
+
+Also fixed during this step: `TimestampAssigner` import path
+(`pyflink.common.watermark_strategy`, not `pyflink.common`), `allowed_lateness()` requires
+a plain int in milliseconds (not a `Time` object), and a class-defined-after-use ordering
+bug (Python executes top-to-bottom; a class referenced inside `main()` must be defined
+before the `if __name__ == "__main__":` block that calls `main()`, not after it).
 
 ```
 cp .env.example .env

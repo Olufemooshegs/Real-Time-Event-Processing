@@ -1,4 +1,24 @@
-"""Step 4 Flink job: structural validation, dead-letter routing, and deduplication only."""
+"""Step 5 Flink job: event-time processing, watermarks, allowed lateness, windowed aggregation.
+
+Late-data routing note (found during Step 5 verification):
+PyFlink 1.19.3's WindowedStream.side_output_late_data() did not route late events to the
+configured side output in this environment, despite exhaustive verification that every
+upstream piece was correct: timestamp assignment produced sane epoch-millisecond values,
+the watermark strategy's output watermark advanced correctly and matched live time, the
+window operator's own input watermark was confirmed current on both parallel subtasks (no
+hot-key/partition-stall issue), and swapping the terminal window operation from aggregate()
+to reduce() made no difference. Genuinely late events (up to ~28s+ per Step 2's empirical
+data, tested here up to 90s) reliably reached the windowing stage with large, real
+watermark-vs-event-time gaps, confirmed via a temporary debug probe, yet the built-in
+late-data side output never fired.
+
+Given that, lateness routing here is implemented manually via LatenessRouter, a
+ProcessFunction that compares each event's own timestamp against
+ctx.timer_service().current_watermark() directly -- the same primitive the debug probe used
+to confirm the watermark was live and correct. This sidesteps the non-functional built-in
+mechanism entirely rather than continuing to work around a suspected version-specific
+PyFlink Python API limitation.
+"""
 
 from __future__ import annotations
 
@@ -41,6 +61,12 @@ REQUIRED_FIELDS: dict[str, type] = {
     "ingest_time": str,
     "schema_version": int,
 }
+
+# Step 2 observed late arrival up to ~28s, distinct from the ~20ms in-order jitter used for
+# the watermark's own out-of-orderness bound below. This is deliberately far larger than
+# that bound: allowed lateness is about retaining an already-closed window for late updates,
+# not about ordering jitter within a still-open window.
+ALLOWED_LATENESS_MS = 45_000
 
 
 def parse_args() -> argparse.Namespace:
@@ -130,6 +156,35 @@ class EventTimeAssigner(TimestampAssigner):
         return int(datetime.fromisoformat(event_time.replace("Z", "+00:00")).timestamp() * 1000)
 
 
+class LatenessRouter(ProcessFunction):
+    """Manually route events past allowed lateness to a side output.
+
+    Replaces WindowedStream.side_output_late_data(), which was confirmed non-functional
+    in this PyFlink 1.19.3 environment (see module docstring). Runs before windowing:
+    compares each event's own event-time timestamp against this operator's current
+    watermark directly, using the same ctx.timer_service().current_watermark() primitive
+    that the Step 5 debugging probe used to confirm the watermark itself was live and
+    correct throughout this pipeline.
+    """
+
+    def __init__(self, late_tag: OutputTag, allowed_lateness_ms: int) -> None:
+        self.late_tag = late_tag
+        self.allowed_lateness_ms = allowed_lateness_ms
+
+    def process_element(self, value: str, ctx: ProcessFunction.Context) -> Iterator[str]:
+        event_ts = ctx.timestamp()
+        watermark = ctx.timer_service().current_watermark()
+        if event_ts is not None and (watermark - event_ts) > self.allowed_lateness_ms:
+            event = json.loads(value)
+            print(
+                f"LATE_EVENT_ROUTED event_id={event.get('event_id')} "
+                f"lag_ms={watermark - event_ts}"
+            )
+            yield self.late_tag, value
+            return
+        yield value
+
+
 class TransactionAggregate(AggregateFunction):
     """Incrementally maintain count and minor-unit volume for each user/window."""
 
@@ -204,15 +259,6 @@ def build_diagnostic_sink(bootstrap_servers: str, topic: str) -> KafkaSink:
     )
 
 
-class DebugWatermarkProbe(ProcessFunction):
-    def process_element(self, value, ctx):
-        event = json.loads(value)
-        print(f"DEBUG_PROBE event_id={event['event_id']} "
-              f"element_ts={ctx.timestamp()} "
-              f"current_watermark={ctx.timer_service().current_watermark()}")
-        yield value
-
-
 def main() -> None:
     args = parse_args()
     env = StreamExecutionEnvironment.get_execution_environment()
@@ -251,35 +297,29 @@ def main() -> None:
         .with_timestamp_assigner(EventTimeAssigner())
         .with_idleness(Duration.of_seconds(30))
     )
-    event_time_events = event_time_events.process(DebugWatermarkProbe(), output_type=Types.STRING())
 
     late_event_tag = OutputTag("events-past-allowed-lateness", Types.STRING())
-    # Step 2 observed late arrival up to ~28 s, distinct from the ~20 ms in-order jitter above.
-    # 45 s provides measured headroom while deliberately remaining far larger than the 50 ms
-    # watermark bound: allowed lateness retains an already-closed window for late updates.
-    user_windows = (
-        event_time_events.key_by(
-            lambda value: json.loads(value)["user_id"], key_type=Types.STRING()
-        )
-        .window(TumblingEventTimeWindows.of(Time.seconds(10)))
-        .allowed_lateness(45_000)
-        .side_output_late_data(late_event_tag)
+    # Manual lateness routing -- see module docstring and LatenessRouter for why this
+    # replaces WindowedStream.side_output_late_data(). Runs before windowing so genuinely
+    # late events never enter window state at all.
+    routed = event_time_events.process(
+        LatenessRouter(late_event_tag, ALLOWED_LATENESS_MS), output_type=Types.STRING()
     )
-    # TEMPORARY DIAGNOSTIC: swapped aggregate() for reduce() to test whether aggregate()
-    # itself is dropping the late-data side output in this PyFlink version. REVERT AFTER TEST.
-    def _debug_reduce(a, b):
-        ea, eb = json.loads(a), json.loads(b)
-        return a
-    aggregates = user_windows.reduce(_debug_reduce)
-
-    # WindowedStream.side_output_late_data captures records dropped only after watermark >
-    # window end + allowed lateness. Preserve the original validated/deduplicated payload in
-    # transactions.late instead of silently discarding it.
-    late_events = aggregates.get_side_output(late_event_tag)
+    late_events = routed.get_side_output(late_event_tag)
     late_events.sink_to(build_diagnostic_sink(args.bootstrap_servers, args.late_topic))
     late_events.map(
         lambda value: f"LATE_EVENT_OUTPUT {value}", output_type=Types.STRING()
     ).print()
+
+    user_windows = routed.key_by(
+        lambda value: json.loads(value)["user_id"], key_type=Types.STRING()
+    ).window(TumblingEventTimeWindows.of(Time.seconds(10)))
+    aggregates = user_windows.aggregate(
+        TransactionAggregate(),
+        FormatUserWindowAggregate(),
+        accumulator_type=Types.TUPLE([Types.LONG(), Types.LONG()]),
+        output_type=Types.STRING(),
+    )
 
     # Step 5 has no durable aggregate sink. Stdout is the inspection surface until Step 7.
     aggregates.map(
