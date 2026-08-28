@@ -190,6 +190,29 @@ late event; the watermark's own out-of-orderness bound should be sized closer to
 more common jitter scale. Exact values still to be picked in Step 5, now against real
 measured ranges rather than placeholders.
 
+**Step 5 decision (2026-08-24):** out-of-orderness bound set to 50ms (2.5x the ~20ms
+measured jitter), with 30s idleness detection to prevent quiet/skewed partitions from
+stalling the watermark. Allowed lateness set to 45s (headroom over the ~28s measured
+maximum), deliberately kept far larger than the 50ms watermark bound per the reasoning
+above.
+
+**Finding: PyFlink 1.19.3's `WindowedStream.side_output_late_data()` does not route late
+events to its configured side output in this environment.** Verified via source inspection
+that `allowed_lateness()`, `side_output_late_data()`, and the internal
+`_get_result_data_stream()` all correctly wire the late-data output tag into the underlying
+Java window operator — this is not a misconfiguration. Confirmed via Flink's REST metrics
+API that the watermark itself was live, current, and identical across both parallel
+subtasks (ruling out a hot-key/partition watermark stall). Confirmed via a temporary debug
+probe that genuinely late events (up to 90s delay, tested against a 45s allowed-lateness
+threshold) reached the windowing stage with large, real watermark-vs-event-time gaps.
+Swapping the terminal window operation from `.aggregate()` to `.reduce()` made no
+difference. With every other cause ruled out, this is treated as a PyFlink Python-binding
+limitation specific to this version, not a design or config error. **Resolution:** late-data
+routing reimplemented manually via a `LatenessRouter` `ProcessFunction`, comparing each
+event's own timestamp against `ctx.timer_service().current_watermark()` directly, run
+before windowing. Confirmed working via both log output and durable topic content
+(741 records verified in `transactions.late`).
+
 ### Windowing
 
 Tumbling windows at 10s / 1m / 5m / 1h, keyed by `user_id` for per-user aggregates and
@@ -206,6 +229,16 @@ Two rules, both stated in the original spec:
 Rule 2 requires maintaining a rolling percentile estimate in keyed state — worth flagging now
 because it's meaningfully more state-heavy than rule 1, and if state size becomes a checkpoint-
 duration problem in Step 12, this is the first place to look.
+
+**Step 6 decision (implemented):** velocity threshold set to >10 transactions/user/60s
+(event-time horizon). Amount rule uses a bounded reservoir of the user's last 256 amounts
+(not an exact percentile calculation — acceptable per this section's original scope note),
+with a 20-record warmup before the rule activates, avoiding false positives on new users.
+Both verified against real traffic: velocity confirmed escalating correctly under a
+deliberate burst; amount confirmed against real outlier transactions with correct
+percentile values reported alongside each trigger; zero false positives confirmed under
+normal low-volume traffic. Output is stdout-only at this stage (`ANOMALY_VELOCITY`,
+`ANOMALY_AMOUNT`) — durable sink deferred to Step 7 along with the other Postgres sinks.
 
 ---
 

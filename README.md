@@ -1,6 +1,6 @@
 # Real-Time Event Processing & Analytics Platform
 
-Status: **in progress — Step 5 of 12 complete, moving to Step 6 (see docs/architecture-design-doc.md for the full plan)**
+Status: **in progress — Step 6 of 12 complete, moving to Step 7 (see docs/architecture-design-doc.md for the full plan)**
 
 This README is updated after each step with what's actually running and verified, not what's
 planned. If something isn't listed under "What's running" below, it doesn't exist yet.
@@ -210,6 +210,26 @@ Also fixed during this step: `TimestampAssigner` import path
 a plain int in milliseconds (not a `Time` object), and a class-defined-after-use ordering
 bug (Python executes top-to-bottom; a class referenced inside `main()` must be defined
 before the `if __name__ == "__main__":` block that calls `main()`, not after it).
+
+### Step 6 — Stateful anomaly detection (closed)
+Two deterministic rules, additive off the Step 5 event-time stream, no changes to
+validation/dedup/windowing:
+- **Velocity:** >10 transactions/user within a 60-second event-time horizon (keyed state
+  counter).
+- **Amount:** current transaction exceeds the user's own rolling 99th-percentile amount,
+  computed over a bounded reservoir of the user's last 256 amounts, with a 20-record
+  warmup period to avoid false positives on new users with too little history.
+
+Verified with real traffic, not just log presence:
+- Velocity rule confirmed correctly escalating under a real burst (`--user-pool-size 5`,
+  50/sec): e.g. `usr_00005` fired repeatedly as its count climbed past threshold
+  (11, 12, 13...17), each with correct `transaction_count`/`threshold` values.
+- Amount rule confirmed with real percentile math, e.g. `usr_00004`: amount 680,762 vs.
+  rolling 99th percentile 302,955 (genuine large outlier); `usr_00005`: two separate
+  correct triggers (227,375 vs. 220,529; 527,965 vs. 224,737), with `history_size: 256`
+  confirming the reservoir cap holds as designed.
+- Confirmed zero false positives under normal, low-volume, full-pool traffic (5/sec,
+  default user pool) — no anomalies fired.
 
 ```
 cp .env.example .env
