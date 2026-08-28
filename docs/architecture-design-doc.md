@@ -238,7 +238,8 @@ Both verified against real traffic: velocity confirmed escalating correctly unde
 deliberate burst; amount confirmed against real outlier transactions with correct
 percentile values reported alongside each trigger; zero false positives confirmed under
 normal low-volume traffic. Output is stdout-only at this stage (`ANOMALY_VELOCITY`,
-`ANOMALY_AMOUNT`) — durable sink deferred to Step 7 along with the other Postgres sinks.
+`ANOMALY_AMOUNT`) — durable Postgres sinks are implemented in Step 7; the Kafka aggregate
+sink remains deferred.
 
 ---
 
@@ -292,6 +293,25 @@ depends entirely on the sink:
 | ClickHouse | Deferred — see below | N/A until justified |
 
 ---
+
+### Step 7 implementation
+
+The planned Postgres sink is now implemented through the versioned migration
+`infrastructure/postgres/migrations/V002__analytics_schema.sql`, bootstrapped by
+`infrastructure/postgres/init.sql`. It creates `transactions.events` keyed by `event_id`,
+`transactions.window_aggregates` keyed by `(user_id, window_start)`, and an append-only
+`transactions.anomalies` table with rule-specific nullable columns.
+
+The Flink job writes through JDBC using one-second or 100-row batches. Events use
+`ON CONFLICT (event_id) DO UPDATE`; this idempotent upsert is deliberate exactly-once
+groundwork because checkpoint recovery can replay a batch before Step 8 failure-injection
+tests. Window aggregates use `ON CONFLICT (user_id, window_start) DO UPDATE`, allowing
+late-but-within-allowed-lateness data to revise an existing window row. Anomalies remain
+append-only because they are diagnostic and duplicate retry records are an accepted
+tradeoff. The JDBC sink itself is not yet an end-to-end exactly-once proof.
+
+The `analytics.aggregates` Kafka sink remains planned, and ClickHouse remains deferred
+pending the Step 12 benchmark decision.
 
 ## 7. Failure Scenarios (to be executed in Step 9, listed here for design completeness)
 

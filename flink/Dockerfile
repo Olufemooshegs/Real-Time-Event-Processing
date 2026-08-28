@@ -8,6 +8,12 @@ RUN apt-get update \
     && curl --fail --location --silent --show-error \
       --output /opt/flink/lib/flink-sql-connector-kafka-3.3.0-1.19.jar \
 https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.3.0-1.19/flink-sql-connector-kafka-3.3.0-1.19.jar \
+    && curl --fail --location --silent --show-error \
+      --output /opt/flink/lib/flink-connector-jdbc-3.2.0-1.19.jar \
+https://repo1.maven.org/maven2/org/apache/flink/flink-connector-jdbc/3.2.0-1.19/flink-connector-jdbc-3.2.0-1.19.jar \
+    && curl --fail --location --silent --show-error \
+      --output /opt/flink/lib/postgresql-42.7.3.jar \
+https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.3/postgresql-42.7.3.jar \
     && apt-get purge -y --auto-remove curl \
     && rm -rf /var/lib/apt/lists/*
 

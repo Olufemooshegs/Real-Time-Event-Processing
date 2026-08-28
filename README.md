@@ -1,6 +1,6 @@
 # Real-Time Event Processing & Analytics Platform
 
-Status: **in progress — Step 6 of 12 complete, moving to Step 7 (see docs/architecture-design-doc.md for the full plan)**
+Status: **in progress — Step 7 of 12 in implementation (see docs/architecture-design-doc.md for the full plan)**
 
 This README is updated after each step with what's actually running and verified, not what's
 planned. If something isn't listed under "What's running" below, it doesn't exist yet.
@@ -11,15 +11,16 @@ planned. If something isn't listed under "What's running" below, it doesn't exis
 
 - **Kafka**, single broker, KRaft mode (no Zookeeper), topic `transactions.raw` with 6
   partitions, replication factor 1.
-- **Postgres**, with an initial `transactions.events` schema shell (not the real analytics
-  schema yet — that comes in Step 7).
+- **Postgres**, with the Step 7 versioned schema for validated events, window aggregates,
+  and anomaly records.
+- **Flink**, with validation, deduplication, event-time windows, deterministic anomalies,
+  and batched JDBC sinks to Postgres.
 - **Async transaction producer** (`producers/transaction_generator/main.py`, `aiokafka`),
   running as a plain local Python process, not containerized (deliberate choice for this
   phase — see "Decisions" below).
 
 ## What's explicitly NOT built yet
 
-- Flink (validation, deduplication, watermarks, windowing, stateful anomaly detection)
 - FastAPI analytics API
 - ClickHouse
 - Prometheus / Grafana

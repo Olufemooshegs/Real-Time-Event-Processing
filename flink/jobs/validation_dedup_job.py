@@ -1,4 +1,4 @@
-"""Step 6 Flink job: event-time processing, windows, and deterministic anomalies.
+"""Step 7 Flink job: event-time processing, deterministic anomalies, and Postgres sinks.
 
 Late-data routing note (found during Step 5 verification):
 PyFlink 1.19.3's WindowedStream.side_output_late_data() did not route late events to the
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import datetime
 from typing import Any, Iterable, Iterator
 
@@ -40,6 +41,11 @@ from pyflink.datastream.connectors.kafka import (
     KafkaSource,
 )
 from pyflink.datastream.connectors.base import DeliveryGuarantee
+from pyflink.datastream.connectors.jdbc import (
+    JdbcConnectionOptions,
+    JdbcExecutionOptions,
+    JdbcSink,
+)
 from pyflink.datastream.functions import (
     AggregateFunction,
     KeyedProcessFunction,
@@ -80,6 +86,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deadletter-topic", default="transactions.deadletter")
     parser.add_argument("--late-topic", default="transactions.late")
     parser.add_argument("--consumer-group", default="flink-validation-dedup-v1")
+    parser.add_argument("--postgres-url", default=os.getenv("POSTGRES_JDBC_URL"))
+    parser.add_argument("--postgres-user", default=os.getenv("POSTGRES_USER"))
+    parser.add_argument("--postgres-password", default=os.getenv("POSTGRES_PASSWORD"))
     return parser.parse_args()
 
 
@@ -298,6 +307,144 @@ class UserAnomalyDetection(KeyedProcessFunction):
         self.amount_history.update(amounts[-PERCENTILE_HISTORY_LIMIT:])
 
 
+EVENT_ROW_TYPE = Types.ROW(
+    [
+        Types.STRING(),
+        Types.STRING(),
+        Types.STRING(),
+        Types.LONG(),
+        Types.STRING(),
+        Types.STRING(),
+        Types.STRING(),
+        Types.STRING(),
+        Types.INT(),
+    ]
+)
+AGGREGATE_ROW_TYPE = Types.ROW(
+    [Types.STRING(), Types.LONG(), Types.LONG(), Types.LONG(), Types.LONG(), Types.DOUBLE()]
+)
+ANOMALY_ROW_TYPE = Types.ROW(
+    [
+        Types.STRING(),
+        Types.STRING(),
+        Types.STRING(),
+        Types.LONG(),
+        Types.INT(),
+        Types.LONG(),
+        Types.LONG(),
+        Types.DOUBLE(),
+        Types.INT(),
+    ]
+)
+
+
+def postgres_options(args: argparse.Namespace) -> tuple[JdbcConnectionOptions, JdbcExecutionOptions]:
+    if not args.postgres_url or not args.postgres_user or not args.postgres_password:
+        raise ValueError(
+            "Postgres sink requires POSTGRES_JDBC_URL, POSTGRES_USER, and POSTGRES_PASSWORD"
+        )
+    connection = (
+        JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
+        .with_url(args.postgres_url)
+        .with_driver_name("org.postgresql.Driver")
+        .with_user_name(args.postgres_user)
+        .with_password(args.postgres_password)
+        .build()
+    )
+    execution = (
+        JdbcExecutionOptions.builder()
+        .with_batch_interval_ms(1000)
+        .with_batch_size(100)
+        .with_max_retries(3)
+        .build()
+    )
+    return connection, execution
+
+
+def event_to_row(value: str) -> tuple[Any, ...]:
+    event = json.loads(value)
+    return (
+        event["event_id"],
+        event["user_id"],
+        event["merchant_id"],
+        event["amount"],
+        event["currency"],
+        event["transaction_type"],
+        event["event_time"],
+        event["ingest_time"],
+        event["schema_version"],
+    )
+
+
+def aggregate_to_row(value: str) -> tuple[Any, ...]:
+    aggregate = json.loads(value)
+    return (
+        aggregate["user_id"],
+        aggregate["window_start"],
+        aggregate["window_end"],
+        aggregate["transaction_count"],
+        aggregate["total_volume"],
+        aggregate["average_transaction_value"],
+    )
+
+
+def anomaly_to_row(value: str) -> tuple[Any, ...]:
+    anomaly = json.loads(value)
+    return (
+        anomaly["tag"],
+        anomaly["event_id"],
+        anomaly["user_id"],
+        anomaly.get("transaction_count"),
+        anomaly.get("window_seconds"),
+        anomaly.get("threshold"),
+        anomaly.get("amount"),
+        anomaly.get("rolling_99th_percentile"),
+        anomaly.get("history_size"),
+    )
+
+
+def build_postgres_sinks(args: argparse.Namespace) -> tuple[JdbcSink, JdbcSink, JdbcSink]:
+    connection, execution = postgres_options(args)
+    # These are idempotent upserts because Step 8 will replay records after a failure. A
+    # plain INSERT would duplicate rows under Flink's at-least-once JDBC sink behavior even
+    # when checkpointed internal state is restored correctly.
+    events_sink = JdbcSink.sink(
+        """INSERT INTO transactions.events
+            (event_id,user_id,merchant_id,amount,currency,transaction_type,event_time,ingest_time,schema_version)
+            VALUES (?::uuid,?,?,?,?,?,?::timestamptz,?::timestamptz,?)
+            ON CONFLICT (event_id) DO UPDATE SET
+              user_id=EXCLUDED.user_id, merchant_id=EXCLUDED.merchant_id, amount=EXCLUDED.amount,
+              currency=EXCLUDED.currency, transaction_type=EXCLUDED.transaction_type,
+              event_time=EXCLUDED.event_time, ingest_time=EXCLUDED.ingest_time,
+              schema_version=EXCLUDED.schema_version""",
+        EVENT_ROW_TYPE,
+        connection,
+        execution,
+    )
+    aggregates_sink = JdbcSink.sink(
+        """INSERT INTO transactions.window_aggregates
+            (user_id,window_start,window_end,transaction_count,total_volume,average_transaction_value)
+            VALUES (?,to_timestamp(?::double precision/1000),to_timestamp(?::double precision/1000),?,?,?)
+            ON CONFLICT (user_id,window_start) DO UPDATE SET
+              window_end=EXCLUDED.window_end, transaction_count=EXCLUDED.transaction_count,
+              total_volume=EXCLUDED.total_volume, average_transaction_value=EXCLUDED.average_transaction_value,
+              updated_at=CURRENT_TIMESTAMP""",
+        AGGREGATE_ROW_TYPE,
+        connection,
+        execution,
+    )
+    anomalies_sink = JdbcSink.sink(
+        """INSERT INTO transactions.anomalies
+            (anomaly_type,event_id,user_id,transaction_count,velocity_window_seconds,velocity_threshold,
+             amount,rolling_99th_percentile,history_size)
+            VALUES (?,?::uuid,?,?,?,?,?,?,?)""",
+        ANOMALY_ROW_TYPE,
+        connection,
+        execution,
+    )
+    return events_sink, aggregates_sink, anomalies_sink
+
+
 def build_deadletter_sink(bootstrap_servers: str, topic: str) -> KafkaSink:
     serializer = (
         KafkaRecordSerializationSchema.builder()
@@ -334,6 +481,7 @@ def build_diagnostic_sink(bootstrap_servers: str, topic: str) -> KafkaSink:
 
 def main() -> None:
     args = parse_args()
+    events_sink, aggregates_sink, anomalies_sink = build_postgres_sinks(args)
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_parallelism(2)
     env.enable_checkpointing(10_000, CheckpointingMode.EXACTLY_ONCE)
@@ -394,10 +542,11 @@ def main() -> None:
         output_type=Types.STRING(),
     )
 
-    # Step 5 has no durable aggregate sink. Stdout is the inspection surface until Step 7.
+    # Keep stdout as an inspection surface even after adding the durable Step 7 sink.
     aggregates.map(
         lambda value: f"USER_WINDOW_AGGREGATE {value}", output_type=Types.STRING()
     ).print()
+    aggregates.map(aggregate_to_row, output_type=AGGREGATE_ROW_TYPE).add_sink(aggregates_sink)
 
     # Keep the existing Step 4 per-record verification output additive to windowing.
     deduplicated.map(
@@ -410,8 +559,13 @@ def main() -> None:
     anomalies.map(
         lambda value: f"{json.loads(value)['tag']} {value}", output_type=Types.STRING()
     ).print()
+    anomalies.map(anomaly_to_row, output_type=ANOMALY_ROW_TYPE).add_sink(anomalies_sink)
 
-    env.execute("step-6-event-time-validation-deduplication-and-anomalies")
+    # This sink receives only the already validated and event_id-deduplicated stream. The
+    # PostgreSQL primary key and ON CONFLICT upsert make retries safe for Step 8 recovery work.
+    deduplicated.map(event_to_row, output_type=EVENT_ROW_TYPE).add_sink(events_sink)
+
+    env.execute("step-7-event-time-validation-deduplication-anomalies-and-postgres-sinks")
 
 
 if __name__ == "__main__":

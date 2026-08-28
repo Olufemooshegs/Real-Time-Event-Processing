@@ -1,4 +1,4 @@
-.PHONY: up down logs health topics-apply topic-create topic-describe flink-up flink-health flink-job-submit flink-logs flink-api-check flink-anomaly-api-check
+.PHONY: up down logs health topics-apply topic-create topic-describe flink-up flink-health flink-job-submit flink-logs flink-api-check flink-anomaly-api-check flink-jdbc-api-check
 
 up:
 	docker compose up -d
@@ -46,3 +46,6 @@ flink-api-check:
 
 flink-anomaly-api-check:
 	docker compose exec -T jobmanager python3 -c "from pyflink.common import Types; from pyflink.datastream.functions import KeyedProcessFunction; from pyflink.datastream.state import ValueStateDescriptor; help(KeyedProcessFunction); help(ValueStateDescriptor); help(Types.LIST); help(Types.LONG)"
+
+flink-jdbc-api-check:
+	docker compose exec -T jobmanager python3 -c "from pyflink.datastream.connectors.jdbc import JdbcSink, JdbcConnectionOptions, JdbcExecutionOptions; help(JdbcSink.sink); help(JdbcConnectionOptions.JdbcConnectionOptionsBuilder); help(JdbcExecutionOptions.builder)"

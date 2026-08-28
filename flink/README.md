@@ -16,7 +16,30 @@ Records arriving after `watermark > window_end + 45 seconds` are routed by the m
 
 The on-time, validated, deduplicated stream now has an additive per-user anomaly branch. Velocity is a rolling **60-second event-time horizon** with a threshold of **more than 10 transactions**. Ten is deliberately low enough to make a one-user burst observable in this development workload while remaining above ordinary low-rate traffic.
 
-Amount anomalies compare each transaction with that user's rolling 99th-percentile historical amount. The estimate uses the most recent **256 amounts per user**, with a **20-amount warm-up** before evaluation. This bounded history is intentionally approximate: an unbounded exact per-user history would grow checkpoint state indefinitely. The branch emits no durable sink yet; it prints `ANOMALY_VELOCITY` or `ANOMALY_AMOUNT` JSON records for Step 6 verification.
+Amount anomalies compare each transaction with that user's rolling 99th-percentile historical amount. The estimate uses the most recent **256 amounts per user**, with a **20-amount warm-up** before evaluation. This bounded history is intentionally approximate: an unbounded exact per-user history would grow checkpoint state indefinitely. The branch prints `ANOMALY_VELOCITY` or `ANOMALY_AMOUNT` JSON records for inspection and Step 7 also appends those records to `transactions.anomalies`.
+
+## Postgres sinks (Step 7)
+
+`infrastructure/postgres/migrations/V002__analytics_schema.sql` replaces the Step 1
+connectivity shell with three durable tables: `transactions.events`,
+`transactions.window_aggregates`, and `transactions.anomalies`. `init.sql` includes the
+versioned migration on first database initialization, and the migration is safe to rerun:
+it only drops the old shell when it does not contain the real `event_id` column.
+
+The job receives `POSTGRES_JDBC_URL`, `POSTGRES_USER`, and `POSTGRES_PASSWORD` from Compose
+(or equivalent CLI arguments). It uses the Flink JDBC connector with a PostgreSQL JDBC
+driver and one-second or 100-row batches. Validated, deduplicated events use an
+`ON CONFLICT (event_id) DO UPDATE` upsert, which is the idempotent sink behavior needed for
+Step 8 replay testing. Window aggregates use `ON CONFLICT (user_id, window_start) DO UPDATE`
+so late-but-allowed updates revise the existing row. Anomalies are append-only diagnostic
+records, so retry duplicates are an accepted tradeoff. This is exactly-once groundwork,
+not a completed end-to-end exactly-once proof; Step 8 will test recovery semantics.
+
+Rebuild both Flink services after changing the job or connector jars:
+
+```bash
+docker compose build jobmanager taskmanager
+```
 
 ## Start and submit
 
@@ -51,6 +74,8 @@ The deduplication TTL is 10 minutes. Step 2 verified exact-payload producer retr
 
 ## Caveats
 
-This job intentionally has no merchant windows, semantic validation, anomaly detection, Postgres sink, or aggregate Kafka sink. Those belong to later steps.
+This job intentionally has no merchant windows, semantic validation, or aggregate Kafka sink.
+ClickHouse and the API are also deferred to later steps. The Postgres sinks are intentionally
+batched JDBC writes and should be benchmarked before any production-scale claim.
 
 PyFlink process functions and Python serialization add overhead relative to a Java implementation. That tradeoff is appropriate for consistency with the Python stack and this minimal job, but it must be measured during the later throughput benchmark rather than treated as production-scale evidence.
