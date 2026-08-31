@@ -28,6 +28,7 @@ import os
 from datetime import datetime
 from typing import Any, Iterable, Iterator
 
+import psycopg2
 from pyflink.common import Duration, Types, WatermarkStrategy
 from pyflink.common.watermark_strategy import TimestampAssigner
 from pyflink.datastream import FileSystemCheckpointStorage
@@ -403,6 +404,137 @@ def anomaly_to_row(value: str) -> tuple[Any, ...]:
     )
 
 
+class _PostgresSinkBase(ProcessFunction):
+    """Shared connection lifecycle for direct psycopg2-based Postgres sinks.
+
+    Bypasses PyFlink's JdbcSink.sink(), which depends on a static method
+    (createRowJdbcStatementBuilder) that flink-connector-jdbc removed from its
+    internal API before Flink 1.19 -- confirmed by decompiling the JAR's class
+    file directly (javap unavailable in this image; inspected via zipfile +
+    bytecode string scan instead). No available connector JAR version restores
+    that method, so JdbcSink.sink() is unusable here regardless of version
+    pinning. Same reasoning as the manual LatenessRouter replacing the
+    non-functional side_output_late_data() in Step 5: work around a confirmed
+    broken built-in rather than keep chasing version compatibility.
+    """
+
+    def __init__(self, dsn: str) -> None:
+        self.dsn = dsn
+        self.conn = None
+
+    def open(self, runtime_context: Any) -> None:
+        self.conn = psycopg2.connect(self.dsn)
+        self.conn.autocommit = True
+
+    def close(self) -> None:
+        if self.conn is not None:
+            self.conn.close()
+
+
+class PostgresEventsSink(_PostgresSinkBase):
+    """Idempotent upsert of validated/deduplicated events, keyed by event_id.
+
+    Upsert (not plain INSERT) matters for Step 8: at-least-once replay after a
+    failure must not duplicate rows even though Flink's own checkpointed state
+    recovers correctly.
+    """
+
+    def process_element(self, value: str, ctx: ProcessFunction.Context) -> Iterator[None]:
+        event = json.loads(value)
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO transactions.events
+                    (event_id, user_id, merchant_id, amount, currency,
+                     transaction_type, event_time, ingest_time, schema_version)
+                VALUES (%s::uuid, %s, %s, %s, %s, %s, %s::timestamptz, %s::timestamptz, %s)
+                ON CONFLICT (event_id) DO UPDATE SET
+                    user_id = EXCLUDED.user_id, merchant_id = EXCLUDED.merchant_id,
+                    amount = EXCLUDED.amount, currency = EXCLUDED.currency,
+                    transaction_type = EXCLUDED.transaction_type,
+                    event_time = EXCLUDED.event_time, ingest_time = EXCLUDED.ingest_time,
+                    schema_version = EXCLUDED.schema_version
+                """,
+                (
+                    event["event_id"], event["user_id"], event["merchant_id"],
+                    event["amount"], event["currency"], event["transaction_type"],
+                    event["event_time"], event["ingest_time"], event["schema_version"],
+                ),
+            )
+        return iter(())
+
+
+class PostgresAggregatesSink(_PostgresSinkBase):
+    """Upsert windowed aggregates keyed by (user_id, window_start).
+
+    Upsert lets a window's row update in place when late-but-allowed data
+    arrives, instead of creating a duplicate row for the same window.
+    """
+
+    def process_element(self, value: str, ctx: ProcessFunction.Context) -> Iterator[None]:
+        agg = json.loads(value)
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO transactions.window_aggregates
+                    (user_id, window_start, window_end, transaction_count,
+                     total_volume, average_transaction_value)
+                VALUES (%s, to_timestamp(%s::double precision / 1000),
+                        to_timestamp(%s::double precision / 1000), %s, %s, %s)
+                ON CONFLICT (user_id, window_start) DO UPDATE SET
+                    window_end = EXCLUDED.window_end,
+                    transaction_count = EXCLUDED.transaction_count,
+                    total_volume = EXCLUDED.total_volume,
+                    average_transaction_value = EXCLUDED.average_transaction_value,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    agg["user_id"], agg["window_start"], agg["window_end"],
+                    agg["transaction_count"], agg["total_volume"],
+                    agg["average_transaction_value"],
+                ),
+            )
+        return iter(())
+
+
+class PostgresAnomaliesSink(_PostgresSinkBase):
+    """Append-only anomaly insert. Duplicate diagnostics on retry are an
+    acceptable tradeoff, same reasoning as the deadletter/late Kafka sinks."""
+
+    def process_element(self, value: str, ctx: ProcessFunction.Context) -> Iterator[None]:
+        anomaly = json.loads(value)
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO transactions.anomalies
+                    (anomaly_type, event_id, user_id, transaction_count,
+                     velocity_window_seconds, velocity_threshold, amount,
+                     rolling_99th_percentile, history_size)
+                VALUES (%s, %s::uuid, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    anomaly.get("tag"), anomaly["event_id"], anomaly["user_id"],
+                    anomaly.get("transaction_count"), anomaly.get("window_seconds"),
+                    anomaly.get("threshold"), anomaly.get("amount"),
+                    anomaly.get("rolling_99th_percentile"), anomaly.get("history_size"),
+                ),
+            )
+        return iter(())
+
+
+def postgres_dsn(args: argparse.Namespace) -> str:
+    if not args.postgres_url or not args.postgres_user or not args.postgres_password:
+        raise ValueError(
+            "Postgres sink requires POSTGRES_JDBC_URL, POSTGRES_USER, and POSTGRES_PASSWORD"
+        )
+    # args.postgres_url is a JDBC URL (jdbc:postgresql://host:port/db); psycopg2 needs the
+    # plain host/port/db form, so strip the jdbc: prefix psycopg2 does not understand.
+    url = args.postgres_url
+    if url.startswith("jdbc:"):
+        url = url[len("jdbc:"):]
+    return f"{url}?user={args.postgres_user}&password={args.postgres_password}"
+
+
 def build_postgres_sinks(args: argparse.Namespace) -> tuple[JdbcSink, JdbcSink, JdbcSink]:
     connection, execution = postgres_options(args)
     # These are idempotent upserts because Step 8 will replay records after a failure. A
@@ -481,7 +613,7 @@ def build_diagnostic_sink(bootstrap_servers: str, topic: str) -> KafkaSink:
 
 def main() -> None:
     args = parse_args()
-    events_sink, aggregates_sink, anomalies_sink = build_postgres_sinks(args)
+    postgres_dsn_str = postgres_dsn(args)
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_parallelism(2)
     env.enable_checkpointing(10_000, CheckpointingMode.EXACTLY_ONCE)
@@ -546,7 +678,7 @@ def main() -> None:
     aggregates.map(
         lambda value: f"USER_WINDOW_AGGREGATE {value}", output_type=Types.STRING()
     ).print()
-    aggregates.map(aggregate_to_row, output_type=AGGREGATE_ROW_TYPE).add_sink(aggregates_sink)
+    aggregates.process(PostgresAggregatesSink(postgres_dsn_str))
 
     # Keep the existing Step 4 per-record verification output additive to windowing.
     deduplicated.map(
@@ -559,11 +691,11 @@ def main() -> None:
     anomalies.map(
         lambda value: f"{json.loads(value)['tag']} {value}", output_type=Types.STRING()
     ).print()
-    anomalies.map(anomaly_to_row, output_type=ANOMALY_ROW_TYPE).add_sink(anomalies_sink)
+    anomalies.process(PostgresAnomaliesSink(postgres_dsn_str))
 
     # This sink receives only the already validated and event_id-deduplicated stream. The
     # PostgreSQL primary key and ON CONFLICT upsert make retries safe for Step 8 recovery work.
-    deduplicated.map(event_to_row, output_type=EVENT_ROW_TYPE).add_sink(events_sink)
+    deduplicated.process(PostgresEventsSink(postgres_dsn_str))
 
     env.execute("step-7-event-time-validation-deduplication-anomalies-and-postgres-sinks")
 
