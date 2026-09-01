@@ -42,11 +42,6 @@ from pyflink.datastream.connectors.kafka import (
     KafkaSource,
 )
 from pyflink.datastream.connectors.base import DeliveryGuarantee
-from pyflink.datastream.connectors.jdbc import (
-    JdbcConnectionOptions,
-    JdbcExecutionOptions,
-    JdbcSink,
-)
 from pyflink.datastream.functions import (
     AggregateFunction,
     KeyedProcessFunction,
@@ -339,83 +334,16 @@ ANOMALY_ROW_TYPE = Types.ROW(
 )
 
 
-def postgres_options(args: argparse.Namespace) -> tuple[JdbcConnectionOptions, JdbcExecutionOptions]:
-    if not args.postgres_url or not args.postgres_user or not args.postgres_password:
-        raise ValueError(
-            "Postgres sink requires POSTGRES_JDBC_URL, POSTGRES_USER, and POSTGRES_PASSWORD"
-        )
-    connection = (
-        JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
-        .with_url(args.postgres_url)
-        .with_driver_name("org.postgresql.Driver")
-        .with_user_name(args.postgres_user)
-        .with_password(args.postgres_password)
-        .build()
-    )
-    execution = (
-        JdbcExecutionOptions.builder()
-        .with_batch_interval_ms(1000)
-        .with_batch_size(100)
-        .with_max_retries(3)
-        .build()
-    )
-    return connection, execution
-
-
-def event_to_row(value: str) -> tuple[Any, ...]:
-    event = json.loads(value)
-    return (
-        event["event_id"],
-        event["user_id"],
-        event["merchant_id"],
-        event["amount"],
-        event["currency"],
-        event["transaction_type"],
-        event["event_time"],
-        event["ingest_time"],
-        event["schema_version"],
-    )
-
-
-def aggregate_to_row(value: str) -> tuple[Any, ...]:
-    aggregate = json.loads(value)
-    return (
-        aggregate["user_id"],
-        aggregate["window_start"],
-        aggregate["window_end"],
-        aggregate["transaction_count"],
-        aggregate["total_volume"],
-        aggregate["average_transaction_value"],
-    )
-
-
-def anomaly_to_row(value: str) -> tuple[Any, ...]:
-    anomaly = json.loads(value)
-    return (
-        anomaly["tag"],
-        anomaly["event_id"],
-        anomaly["user_id"],
-        anomaly.get("transaction_count"),
-        anomaly.get("window_seconds"),
-        anomaly.get("threshold"),
-        anomaly.get("amount"),
-        anomaly.get("rolling_99th_percentile"),
-        anomaly.get("history_size"),
-    )
-
-
 class _PostgresSinkBase(ProcessFunction):
     """Shared connection lifecycle for direct psycopg2-based Postgres sinks.
 
     Bypasses PyFlink's JdbcSink.sink(), which depends on a static method
     (createRowJdbcStatementBuilder) that flink-connector-jdbc removed from its
-    internal API before Flink 1.19 -- confirmed by decompiling the JAR's class
-    file directly (javap unavailable in this image; inspected via zipfile +
-    bytecode string scan instead). No available connector JAR version restores
-    that method, so JdbcSink.sink() is unusable here regardless of version
-    pinning. Same reasoning as the manual LatenessRouter replacing the
-    non-functional side_output_late_data() in Step 5: work around a confirmed
-    broken built-in rather than keep chasing version compatibility.
+    internal API before Flink 1.19 -- confirmed by inspecting the JAR's class
+    file directly. No available connector JAR version restores that method,
+    so JdbcSink.sink() is unusable here regardless of version pinning. Same
+    reasoning as the manual LatenessRouter replacing the non-functional
+    side_output_late_data() in Step 5.
     """
 
     def __init__(self, dsn: str) -> None:
@@ -423,6 +351,7 @@ class _PostgresSinkBase(ProcessFunction):
         self.conn = None
 
     def open(self, runtime_context: Any) -> None:
+        import psycopg2
         self.conn = psycopg2.connect(self.dsn)
         self.conn.autocommit = True
 
@@ -432,12 +361,7 @@ class _PostgresSinkBase(ProcessFunction):
 
 
 class PostgresEventsSink(_PostgresSinkBase):
-    """Idempotent upsert of validated/deduplicated events, keyed by event_id.
-
-    Upsert (not plain INSERT) matters for Step 8: at-least-once replay after a
-    failure must not duplicate rows even though Flink's own checkpointed state
-    recovers correctly.
-    """
+    """Idempotent upsert of validated/deduplicated events, keyed by event_id."""
 
     def process_element(self, value: str, ctx: ProcessFunction.Context) -> Iterator[None]:
         event = json.loads(value)
@@ -465,11 +389,7 @@ class PostgresEventsSink(_PostgresSinkBase):
 
 
 class PostgresAggregatesSink(_PostgresSinkBase):
-    """Upsert windowed aggregates keyed by (user_id, window_start).
-
-    Upsert lets a window's row update in place when late-but-allowed data
-    arrives, instead of creating a duplicate row for the same window.
-    """
+    """Upsert windowed aggregates keyed by (user_id, window_start)."""
 
     def process_element(self, value: str, ctx: ProcessFunction.Context) -> Iterator[None]:
         agg = json.loads(value)
@@ -498,8 +418,7 @@ class PostgresAggregatesSink(_PostgresSinkBase):
 
 
 class PostgresAnomaliesSink(_PostgresSinkBase):
-    """Append-only anomaly insert. Duplicate diagnostics on retry are an
-    acceptable tradeoff, same reasoning as the deadletter/late Kafka sinks."""
+    """Append-only anomaly insert."""
 
     def process_element(self, value: str, ctx: ProcessFunction.Context) -> Iterator[None]:
         anomaly = json.loads(value)
@@ -527,54 +446,10 @@ def postgres_dsn(args: argparse.Namespace) -> str:
         raise ValueError(
             "Postgres sink requires POSTGRES_JDBC_URL, POSTGRES_USER, and POSTGRES_PASSWORD"
         )
-    # args.postgres_url is a JDBC URL (jdbc:postgresql://host:port/db); psycopg2 needs the
-    # plain host/port/db form, so strip the jdbc: prefix psycopg2 does not understand.
     url = args.postgres_url
     if url.startswith("jdbc:"):
         url = url[len("jdbc:"):]
     return f"{url}?user={args.postgres_user}&password={args.postgres_password}"
-
-
-def build_postgres_sinks(args: argparse.Namespace) -> tuple[JdbcSink, JdbcSink, JdbcSink]:
-    connection, execution = postgres_options(args)
-    # These are idempotent upserts because Step 8 will replay records after a failure. A
-    # plain INSERT would duplicate rows under Flink's at-least-once JDBC sink behavior even
-    # when checkpointed internal state is restored correctly.
-    events_sink = JdbcSink.sink(
-        """INSERT INTO transactions.events
-            (event_id,user_id,merchant_id,amount,currency,transaction_type,event_time,ingest_time,schema_version)
-            VALUES (?::uuid,?,?,?,?,?,?::timestamptz,?::timestamptz,?)
-            ON CONFLICT (event_id) DO UPDATE SET
-              user_id=EXCLUDED.user_id, merchant_id=EXCLUDED.merchant_id, amount=EXCLUDED.amount,
-              currency=EXCLUDED.currency, transaction_type=EXCLUDED.transaction_type,
-              event_time=EXCLUDED.event_time, ingest_time=EXCLUDED.ingest_time,
-              schema_version=EXCLUDED.schema_version""",
-        EVENT_ROW_TYPE,
-        connection,
-        execution,
-    )
-    aggregates_sink = JdbcSink.sink(
-        """INSERT INTO transactions.window_aggregates
-            (user_id,window_start,window_end,transaction_count,total_volume,average_transaction_value)
-            VALUES (?,to_timestamp(?::double precision/1000),to_timestamp(?::double precision/1000),?,?,?)
-            ON CONFLICT (user_id,window_start) DO UPDATE SET
-              window_end=EXCLUDED.window_end, transaction_count=EXCLUDED.transaction_count,
-              total_volume=EXCLUDED.total_volume, average_transaction_value=EXCLUDED.average_transaction_value,
-              updated_at=CURRENT_TIMESTAMP""",
-        AGGREGATE_ROW_TYPE,
-        connection,
-        execution,
-    )
-    anomalies_sink = JdbcSink.sink(
-        """INSERT INTO transactions.anomalies
-            (anomaly_type,event_id,user_id,transaction_count,velocity_window_seconds,velocity_threshold,
-             amount,rolling_99th_percentile,history_size)
-            VALUES (?,?::uuid,?,?,?,?,?,?,?)""",
-        ANOMALY_ROW_TYPE,
-        connection,
-        execution,
-    )
-    return events_sink, aggregates_sink, anomalies_sink
 
 
 def build_deadletter_sink(bootstrap_servers: str, topic: str) -> KafkaSink:
