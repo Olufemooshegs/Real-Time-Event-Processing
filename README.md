@@ -1,6 +1,6 @@
 # Real-Time Event Processing & Analytics Platform
 
-Status: **in progress — Step 7 of 12 in implementation (see docs/architecture-design-doc.md for the full plan)**
+Status: **in progress — Step 7 of 12 complete, moving to Step 8 (see docs/architecture-design-doc.md for the full plan)**
 
 This README is updated after each step with what's actually running and verified, not what's
 planned. If something isn't listed under "What's running" below, it doesn't exist yet.
@@ -11,16 +11,15 @@ planned. If something isn't listed under "What's running" below, it doesn't exis
 
 - **Kafka**, single broker, KRaft mode (no Zookeeper), topic `transactions.raw` with 6
   partitions, replication factor 1.
-- **Postgres**, with the Step 7 versioned schema for validated events, window aggregates,
-  and anomaly records.
-- **Flink**, with validation, deduplication, event-time windows, deterministic anomalies,
-  and batched JDBC sinks to Postgres.
+- **Postgres**, with an initial `transactions.events` schema shell (not the real analytics
+  schema yet — that comes in Step 7).
 - **Async transaction producer** (`producers/transaction_generator/main.py`, `aiokafka`),
   running as a plain local Python process, not containerized (deliberate choice for this
   phase — see "Decisions" below).
 
 ## What's explicitly NOT built yet
 
+- Flink (validation, deduplication, watermarks, windowing, stateful anomaly detection)
 - FastAPI analytics API
 - ClickHouse
 - Prometheus / Grafana
@@ -231,6 +230,35 @@ Verified with real traffic, not just log presence:
   confirming the reservoir cap holds as designed.
 - Confirmed zero false positives under normal, low-volume, full-pool traffic (5/sec,
   default user pool) — no anomalies fired.
+
+### Step 7 — Postgres sinks: events, aggregates, anomalies (closed)
+Versioned migration (`infrastructure/postgres/migrations/V002__analytics_schema.sql`)
+replacing the Step 1 placeholder, adding `transactions.events`,
+`transactions.window_aggregates`, `transactions.anomalies`.
+
+**Finding: PyFlink 1.19.3's `JdbcSink.sink()` is unusable with any current
+`flink-connector-jdbc` release.** The Python wrapper does Java reflection to find a static
+method `createRowJdbcStatementBuilder(int[])` on `JdbcOutputFormat`. Inspecting the actual
+JAR bytecode (`javap` unavailable in this image; inspected via `zipfile` + a raw string
+scan instead) confirmed that method doesn't exist in `flink-connector-jdbc-3.2.0-1.19.jar`
+— the connector was refactored to a `StatementExecutorFactory` pattern. Further research
+showed this refactor predates Flink 1.19 itself (present as of 1.17-SNAPSHOT), meaning no
+current `flink-connector-jdbc` release for 1.19 restores the old method PyFlink 1.19.3
+expects. Not a version-pinning problem — a genuine incompatibility between PyFlink's
+Python `JdbcSink` helper and every available connector release.
+
+**Resolution:** bypassed `JdbcSink.sink()` entirely. Three sinks
+(`PostgresEventsSink`, `PostgresAggregatesSink`, `PostgresAnomaliesSink`) implemented as
+plain `ProcessFunction`s using `psycopg2` directly, each opening its own connection in
+`open()`/closing in `close()`. Same reasoning as Step 5's `LatenessRouter`: work around a
+confirmed-broken built-in rather than keep chasing connector version compatibility.
+
+Verified against real duplicate/burst traffic, not just absence of errors:
+- Idempotent upsert on `event_id` confirmed: zero duplicate rows in `transactions.events`
+  after a run with 15% injected duplicate rate (314 real rows landed, zero duplicates).
+- Idempotent upsert on `(user_id, window_start)` confirmed: zero duplicate window rows.
+- Anomaly sink confirmed with real burst traffic: 628 `ANOMALY_VELOCITY` + 20
+  `ANOMALY_AMOUNT` rows landed correctly.
 
 ```
 cp .env.example .env
