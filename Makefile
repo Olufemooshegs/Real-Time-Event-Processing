@@ -1,4 +1,4 @@
-.PHONY: up down logs health topics-apply topic-create topic-describe flink-up flink-health flink-job-submit flink-logs flink-api-check flink-anomaly-api-check flink-jdbc-api-check
+.PHONY: up down logs health postgres-migrate step8-kill-test topics-apply topic-create topic-describe flink-up flink-health flink-job-submit flink-logs flink-api-check flink-anomaly-api-check flink-jdbc-api-check
 
 up:
 	docker compose up -d
@@ -11,6 +11,12 @@ logs:
 
 health:
 	bash scripts/healthcheck.sh
+
+postgres-migrate:
+	docker compose exec -T postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -f /docker-entrypoint-initdb.d/migrations/V002__analytics_schema.sql'
+
+step8-kill-test:
+	bash scripts/step8-kill-test.sh
 
 topics-apply:
 	bash scripts/apply-topics.sh infrastructure/kafka/topics.yml

@@ -283,6 +283,28 @@ depends entirely on the sink:
 
 ---
 
+### Step 8 experiment protocol and evidence status
+
+The repeatable kill test is `scripts/step8-kill-test.sh`, documented in
+`docs/step8-exactly-once-kill-test.md`. It targets approximately 100,000 records at
+1,000 records/sec on the current 4-core/8-GB host, starts the existing job in detached
+mode, verifies it is `RUNNING`, kills the TaskManager with `SIGKILL` after 20 seconds,
+and waits for checkpoint recovery and sink drain. Kafka partition offsets are captured
+before and after the run, and the exact raw/dead-letter offset ranges are exported.
+
+The script reconciles unique raw `event_id` values against Postgres event IDs and parsed
+dead-letter records. The resulting `unaccounted_ids` count is the measured lost-event
+metric; producer `sent` and raw offset delta are reported separately because duplicate
+retries create repeated raw records. No Step 8 result is asserted in this document until
+the generated evidence is independently checked against JobManager recovery state and
+direct Postgres/Kafka queries.
+
+Downstream Postgres failure is tested separately by stopping the Postgres container for
+approximately 15 seconds during sustained input, restoring it, and recording whether the
+direct `psycopg2` sink keeps the job running or causes task recovery. This is intentionally
+not conflated with a TaskManager failure: checkpointed internal state and a temporarily
+unavailable external sink exercise different recovery paths.
+
 ## 6. Sinks
 
 | Sink | Purpose | Semantics |

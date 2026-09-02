@@ -58,3 +58,7 @@ CREATE TABLE IF NOT EXISTS transactions.anomalies (
 
 CREATE INDEX IF NOT EXISTS anomalies_user_detected_at_idx
     ON transactions.anomalies (user_id, detected_at);
+
+INSERT INTO transactions.schema_migrations (version)
+VALUES ('V002__analytics_schema.sql')
+ON CONFLICT (version) DO NOTHING;

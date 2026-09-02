@@ -79,3 +79,8 @@ ClickHouse and the API are also deferred to later steps. The Postgres sinks are 
 batched JDBC writes and should be benchmarked before any production-scale claim.
 
 PyFlink process functions and Python serialization add overhead relative to a Java implementation. That tradeoff is appropriate for consistency with the Python stack and this minimal job, but it must be measured during the later throughput benchmark rather than treated as production-scale evidence.
+
+The Step 8 recovery experiment is documented at `docs/step8-exactly-once-kill-test.md` and
+is run from the repository root with `scripts/step8-kill-test.sh`. This README does not
+claim a recovery result; the script's generated counts and ID reconciliation are the
+evidence to review.

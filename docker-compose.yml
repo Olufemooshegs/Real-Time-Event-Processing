@@ -65,6 +65,9 @@ services:
         parallelism.default: 2
         execution.checkpointing.interval: 10s
         execution.checkpointing.mode: EXACTLY_ONCE
+        restart-strategy: fixed-delay
+        restart-strategy.fixed-delay.attempts: 10
+        restart-strategy.fixed-delay.delay: 5 s
         state.checkpoints.dir: file:///opt/flink/checkpoints
         state.savepoints.dir: file:///opt/flink/savepoints
       POSTGRES_JDBC_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}

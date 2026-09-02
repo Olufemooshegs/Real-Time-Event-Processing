@@ -1,6 +1,6 @@
 # Real-Time Event Processing & Analytics Platform
 
-Status: **in progress — Step 7 of 12 complete, moving to Step 8 (see docs/architecture-design-doc.md for the full plan)**
+Status: **in progress — Step 8 experiment procedure ready; runtime results pending independent verification (see docs/architecture-design-doc.md for the full plan)**
 
 This README is updated after each step with what's actually running and verified, not what's
 planned. If something isn't listed under "What's running" below, it doesn't exist yet.
@@ -11,15 +11,16 @@ planned. If something isn't listed under "What's running" below, it doesn't exis
 
 - **Kafka**, single broker, KRaft mode (no Zookeeper), topic `transactions.raw` with 6
   partitions, replication factor 1.
-- **Postgres**, with an initial `transactions.events` schema shell (not the real analytics
-  schema yet — that comes in Step 7).
+- **Postgres**, with the Step 7 versioned schema for validated events, window aggregates,
+  and anomaly records.
+- **Flink**, with validation, deduplication, event-time windows, deterministic anomalies,
+  and direct Postgres sinks.
 - **Async transaction producer** (`producers/transaction_generator/main.py`, `aiokafka`),
   running as a plain local Python process, not containerized (deliberate choice for this
   phase — see "Decisions" below).
 
 ## What's explicitly NOT built yet
 
-- Flink (validation, deduplication, watermarks, windowing, stateful anomaly detection)
 - FastAPI analytics API
 - ClickHouse
 - Prometheus / Grafana
@@ -283,6 +284,17 @@ python main.py --rate 50 --duration 30 --duplicate-rate 0.05 --late-rate 0.1 \
   --out-of-order-rate 0.1 --malformed-rate 0.05 --malformed-mode structural
 ```
 See `producers/transaction_generator/README.md` for the full flag reference.
+
+---
+
+## Step 8 exactly-once kill test
+
+The repeatable experiment is documented in [`docs/step8-exactly-once-kill-test.md`](docs/step8-exactly-once-kill-test.md)
+and automated by `scripts/step8-kill-test.sh`. It defaults to approximately 100,000
+records, kills the TaskManager with `SIGKILL` mid-stream, waits for recovery, and records
+Kafka offsets, producer counts, Postgres IDs, and unaccounted event IDs. No result is
+considered verified until the generated evidence is checked against the JobManager state
+and direct Kafka/Postgres queries.
 
 ---
 
