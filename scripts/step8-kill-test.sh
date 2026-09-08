@@ -22,14 +22,14 @@ command -v python3 >/dev/null || die "python3 is required"
 
 offsets() {
   local topic="$1"
-  docker compose exec -T kafka kafka-run-class kafka.tools.GetOffsetShell \
+  docker compose exec -T kafka kafka-get-offsets \
     --broker-list kafka:29092 --topic "$topic" --time -1 2>/dev/null \
     | awk -F: '{sum += $3} END {print sum + 0}'
 }
 
 capture_partition_offsets() {
   local topic="$1" file="$2"
-  docker compose exec -T kafka kafka-run-class kafka.tools.GetOffsetShell \
+  docker compose exec -T kafka kafka-get-offsets \
     --broker-list kafka:29092 --topic "$topic" --time -1 2>/dev/null \
     | sort -t: -nk2 > "$file"
 }
@@ -71,10 +71,10 @@ log "Submitting the existing Step 7 job"
 if docker compose exec -T jobmanager flink list 2>/dev/null | grep -q "RUNNING"; then
   die "a Flink job is already RUNNING; cancel it before starting a controlled experiment"
 fi
-docker compose exec -T jobmanager flink run -d -py /opt/flink/usrlib/jobs/validation_dedup_job.py \
+docker compose exec -T jobmanager flink run -d -pyclientexec /usr/bin/python3 -pyexec /usr/bin/python3 -py /opt/flink/usrlib/jobs/validation_dedup_job.py \
   > "$OUT_DIR/flink-submit.log" 2>&1 &
 submit_pid=$!
-sleep 10
+sleep 30
 docker compose exec -T jobmanager flink list > "$OUT_DIR/flink-before-producer.txt" 2>&1
 grep -q "RUNNING" "$OUT_DIR/flink-before-producer.txt" || die "Flink job is not RUNNING before producer start"
 
@@ -90,6 +90,16 @@ docker compose ps taskmanager > "$OUT_DIR/taskmanager-before-kill.txt"
 log "Forcibly killing TaskManager after ${KILL_AFTER}s (producer remains running)"
 docker compose kill -s SIGKILL taskmanager
 date -u +%FT%TZ > "$OUT_DIR/taskmanager-killed-at.txt"
+# NOTE: restart: unless-stopped does not reliably auto-restart a SIGKILLed container in
+# this environment (confirmed: correct policy set, force-recreated, container still did
+# not come back after SIGKILL -- a known limitation of nested container runtimes such as
+# GitHub Codespaces, where the Docker daemon's restart-policy watcher can be unreliable).
+# Bringing the container back up explicitly here simulates what a production orchestrator
+# (Kubernetes, a real restart-policy-honoring Docker host) would do automatically.
+log "Explicitly restarting TaskManager (restart: unless-stopped is unreliable in this environment)"
+sleep 3
+docker compose up -d taskmanager
+date -u +%FT%TZ > "$OUT_DIR/taskmanager-restarted-at.txt"
 
 wait "$producer_pid"
 wait "$submit_pid" || true
