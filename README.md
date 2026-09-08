@@ -1,6 +1,6 @@
 # Real-Time Event Processing & Analytics Platform
 
-Status: **in progress — Step 8 experiment procedure ready; runtime results pending independent verification (see docs/architecture-design-doc.md for the full plan)**
+Status: **in progress — Step 9 failure matrix procedures ready; runtime results pending independent verification (see docs/architecture-design-doc.md for the full plan)**
 
 This README is updated after each step with what's actually running and verified, not what's
 planned. If something isn't listed under "What's running" below, it doesn't exist yet.
@@ -295,6 +295,16 @@ records, kills the TaskManager with `SIGKILL` mid-stream, waits for recovery, an
 Kafka offsets, producer counts, Postgres IDs, and unaccounted event IDs. No result is
 considered verified until the generated evidence is checked against the JobManager state
 and direct Kafka/Postgres queries.
+
+---
+
+## Step 9 failure-injection matrix
+
+The five rerunnable procedures are documented in
+[`docs/step9-failure-injection-matrix.md`](docs/step9-failure-injection-matrix.md): Kafka
+broker loss, producer restart, Flink-to-Kafka network interruption, Postgres outage, and
+consumer restart with offset-reset comparison. They require real before/after offset and
+Postgres reconciliation; no projected recovery result is recorded here.
 
 ---
 

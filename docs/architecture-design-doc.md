@@ -328,18 +328,26 @@ from a burst test.
 
 ---
 
-## 7. Failure Scenarios (to be executed in Step 9, listed here for design completeness)
+## 7. Failure Scenarios
 
-For each: failure → detection mechanism → recovery mechanism → events replayed →
-events lost → duplicates produced → recovery time.
+Step 9's five rerunnable procedures are in
+`docs/step9-failure-injection-matrix.md`. Each records failure time, detection mechanism,
+recovery mechanism, events replayed, events lost, duplicates produced, and recovery time;
+the shared reconciliation rule is a stable raw-topic offset plus Postgres count across
+three polls, not a fixed sleep.
 
-- Flink TaskManager crash mid-processing
-- Kafka broker failure (single-broker dev setup: this one will be destructive by
-  construction — worth stating now that a real test needs ≥3 brokers, another documented gap)
-- Producer failure / restart
-- Network interruption between Flink and Kafka
-- Postgres unavailability during sink write
-- Consumer group restart with offset reset variations
+| Scenario | Procedure | Environment constraint | Result status |
+|---|---|---|---|
+| Kafka broker failure | Kill sole broker, explicitly bring it back, poll source/sinks | RF=1 means no Kafka fault tolerance can be demonstrated | Pending live run |
+| Producer failure/restart | Kill producer process, start a second bounded run | Producer-side gap is expected while it is stopped | Pending live run |
+| Flink-to-Kafka network interruption | Disconnect/reconnect TaskManager network or block Kafka traffic | Docker disconnect also affects JobManager RPC; record this limitation | Pending live run |
+| Postgres unavailable during writes | Stop/start Postgres during sustained input | Direct psycopg2 sinks have no application reconnect loop | Pending live run |
+| Consumer restart / offset reset | Cancel and resubmit same group, then submit a new earliest group | New group intentionally replays retained raw data | Pending live run |
+
+Step 8's verified baseline remains separate: at 100k-event scale, checkpoint recovery
+produced zero duplicate event IDs, zero duplicate window keys, and zero unaccounted IDs
+after polling to a stable drain. A fixed 45-second wait produced a false missing-event
+count, so Step 9 uses the same stabilization rule.
 
 ---
 
