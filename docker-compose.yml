@@ -65,7 +65,7 @@ services:
         parallelism.default: 2
         execution.checkpointing.interval: 10s
         execution.checkpointing.mode: EXACTLY_ONCE
-        restart-strategy: fixed-delay
+        restart-strategy.type: fixed-delay
         restart-strategy.fixed-delay.attempts: 10
         restart-strategy.fixed-delay.delay: 5 s
         state.checkpoints.dir: file:///opt/flink/checkpoints
@@ -102,6 +102,9 @@ services:
         taskmanager.memory.process.size: 1536m
         taskmanager.memory.managed.size: 256m
         taskmanager.numberOfTaskSlots: 2
+        restart-strategy.type: fixed-delay
+        restart-strategy.fixed-delay.attempts: 10
+        restart-strategy.fixed-delay.delay: 5 s
         parallelism.default: 2
         execution.checkpointing.interval: 10s
         execution.checkpointing.mode: EXACTLY_ONCE

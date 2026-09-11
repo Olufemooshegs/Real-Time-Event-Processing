@@ -42,7 +42,10 @@ flink-health:
 	exit 1
 
 flink-job-submit:
-	docker compose exec -T jobmanager flink run -py /opt/flink/usrlib/jobs/validation_dedup_job.py
+	docker compose exec -T jobmanager flink run \
+		-pyclientexec /usr/bin/python3 \
+		-pyexec /usr/bin/python3 \
+		-py /opt/flink/usrlib/jobs/validation_dedup_job.py
 
 flink-logs:
 	docker compose logs -f taskmanager

@@ -276,6 +276,11 @@ depends entirely on the sink:
   at-least-once restart semantics will duplicate rows even with Flink's internal state correct —
   this is the exact failure mode the design doc's own spec warns about, and it's worth stating
   in writing now so Step 7/8 gets built with an idempotent upsert from the start, not retrofitted.
+  Confirmed empirically in Step 9 Scenario 1: after a terminal job failure and a cold
+resubmission with no savepoint (i.e. Flink's own dedup state fully reset), zero duplicate
+`event_id`s landed in Postgres, demonstrating that end-to-end exactly-once here is a
+property of the idempotent sink, not of Flink's checkpoint recovery, exactly as this
+section predicts.
 - **Kafka sink (`analytics.aggregates`):** transactional producer, `read_committed` isolation
   on any downstream consumer of that topic.
 - **Dead-letter/late topics:** these are diagnostic outputs, not part of the exactly-once
@@ -343,6 +348,20 @@ three polls, not a fixed sleep.
 | Flink-to-Kafka network interruption | Disconnect/reconnect TaskManager network or block Kafka traffic | Docker disconnect also affects JobManager RPC; record this limitation | Pending live run |
 | Postgres unavailable during writes | Stop/start Postgres during sustained input | Direct psycopg2 sinks have no application reconnect loop | Pending live run |
 | Consumer restart / offset reset | Cancel and resubmit same group, then submit a new earliest group | New group intentionally replays retained raw data | Pending live run |
+| Kafka broker failure | Kill sole broker, explicitly bring it back, poll source/sinks | RF=1 means no Kafka fault tolerance can be demonstrated | Closed — see `docs/step9-failure-injection-matrix.md` |
+
+Scenario 1 also surfaced a config bug unrelated to Kafka itself: Flink 1.19's hierarchical
+`config.yaml` silently discarded this project's `restart-strategy.fixed-delay.attempts`/
+`.delay` settings due to a key-schema collision with a bare `restart-strategy: fixed-delay`
+scalar in the same `FLINK_PROPERTIES` block, defaulting to Flink's hardcoded 1-attempt/1s
+library default with no warning logged anywhere. Fixed by using `restart-strategy.type`
+instead of the bare key. Full detail and evidence in the linked doc. Net effect on the
+recovery-time numbers this section discusses: the actual survivable Kafka-outage window
+for this pipeline, as now correctly configured, is approximately 50 seconds
+(10 attempts x 5s delay) before the job fails permanently and requires manual
+resubmission, not automatic recovery of any duration.
+
+
 
 Step 8's verified baseline remains separate: at 100k-event scale, checkpoint recovery
 produced zero duplicate event IDs, zero duplicate window keys, and zero unaccounted IDs
