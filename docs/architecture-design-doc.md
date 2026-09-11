@@ -392,6 +392,10 @@ count, so Step 9 uses the same stabilization rule.
 
 ## 8. Benchmark Methodology (executed in Step 11)
 
+The repeatable harness is `scripts/step11-benchmark.sh`, with output and review procedure
+documented in `docs/step11-benchmark-results.md`. It preserves the methodology below and
+does not pre-fill requested rates as measured results.
+
 Load levels: 1k / 5k / 10k / 50k / 100k events/sec, bounded by whatever the Codespace machine
 type actually allows — reported honestly rather than extrapolated.
 

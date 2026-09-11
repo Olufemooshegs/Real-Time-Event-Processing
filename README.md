@@ -1,6 +1,6 @@
 # Real-Time Event Processing & Analytics Platform
 
-Status: **in progress — Step 9 Scenario 1 (Kafka broker failure) closed; Scenarios 2-4 pending. Step 10 (FastAPI analytics API) closed and verified.**
+Status: **in progress — Step 11 benchmark harness implemented; runtime benchmark results pending independent verification.**
 
 This README is updated after each step with what's actually running and verified, not what's
 planned. If something isn't listed under "What's running" below, it doesn't exist yet.
@@ -408,6 +408,17 @@ make api-health
 
 Available resources are `/users/{user_id}/transactions`,
 `/users/{user_id}/aggregates`, `/users/{user_id}/anomalies`, and global `/anomalies`.
+
+---
+
+## Step 11 benchmark harness
+
+The benchmark harness is `scripts/step11-benchmark.sh`, with the procedure and artifact
+format documented in `docs/step11-benchmark-results.md`. It captures hardware context,
+measured Kafka throughput, consumer lag, discovered Flink metrics, checkpoint durations,
+separate latency percentiles, ID reconciliation, and a recovery run at the highest load
+level that stabilizes. Results remain pending until the harness is run against the live
+Codespace stack.
 
 ---
 
