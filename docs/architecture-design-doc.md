@@ -333,6 +333,26 @@ from a burst test.
 
 ---
 
+## 6a. Analytics API (Step 10)
+
+Read-only FastAPI service (`api/`) over the Step 7 Postgres schema. No write endpoints,
+no ORM (raw parameterized `asyncpg` queries, matching the Flink sinks' direct-`psycopg2`
+approach rather than introducing a second data-access pattern). Keyset pagination
+throughout (`(event_time, event_id)` for transactions, `window_start` for aggregates,
+`(detected_at, anomaly_id)` for anomalies), chosen over offset pagination specifically
+because it rides existing indexes rather than degrading under deep pagination.
+
+**Pool exhaustion is fail-fast, not fail-silent:** a bounded `asyncpg` pool (min 2 / max 10,
+sized for a single dev Postgres instance) with a 2-second acquire timeout returns HTTP 503
+when exhausted, rather than queueing requests and hiding backpressure as added latency —
+the same reasoning already applied to the rate limiter in the companion
+High-Throughput API Service project.
+
+**Known gap:** the global `/anomalies` feed has no index backing its sort order (see
+README Known gaps for detail). Per-user endpoints are unaffected.
+
+---
+
 ## 7. Failure Scenarios
 
 Step 9's five rerunnable procedures are in
@@ -370,7 +390,7 @@ count, so Step 9 uses the same stabilization rule.
 
 ---
 
-## 8. Benchmark Methodology (executed in Step 12)
+## 8. Benchmark Methodology (executed in Step 11)
 
 Load levels: 1k / 5k / 10k / 50k / 100k events/sec, bounded by whatever the Codespace machine
 type actually allows — reported honestly rather than extrapolated.

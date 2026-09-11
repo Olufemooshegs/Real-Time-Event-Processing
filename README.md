@@ -1,6 +1,6 @@
 # Real-Time Event Processing & Analytics Platform
 
-Status: **in progress — Step 9 Scenario 1 (Kafka broker failure) closed and verified; Scenarios 2-5 pending (see docs/architecture-design-doc.md for the full plan)**
+Status: **in progress — Step 9 Scenario 1 (Kafka broker failure) closed; Scenarios 2-4 pending. Step 10 (FastAPI analytics API) closed and verified.**
 
 This README is updated after each step with what's actually running and verified, not what's
 planned. If something isn't listed under "What's running" below, it doesn't exist yet.
@@ -15,8 +15,10 @@ planned. If something isn't listed under "What's running" below, it doesn't exis
   and anomaly records.
 - **Flink**, with validation, deduplication, event-time windows, deterministic anomalies,
   and direct Postgres sinks.
-- **FastAPI analytics API**, read-only over the existing Postgres tables, with asyncpg
-  pooling and cursor-based pagination on port 8000.
+- **FastAPI analytics API** (`api/`), containerized, read-only endpoints over the Step 7
+  Postgres schema: paginated user transactions/aggregates/anomalies plus a global anomaly
+  feed, keyset pagination throughout, fail-fast 503 on pool exhaustion rather than queueing
+  silently.
 - **Async transaction producer** (`producers/transaction_generator/main.py`, `aiokafka`),
   running as a plain local Python process, not containerized (deliberate choice for this
   phase — see "Decisions" below).
@@ -113,6 +115,21 @@ Simpler single-broker dev setup. No operational reason to introduce Zookeeper at
   matching its documented design once this was fixed, midway through Step 9. Full
   before/after evidence, including the forced-failure test that proves the fix, is in
   `docs/step9-failure-injection-matrix.md`.
+
+- **`.gitignore`'s blanket `*.txt` rule silently excluded `api/requirements.txt` from the
+  Step 10 commit.** The rule was written to keep scratch/debug `.txt` output out of the
+  repo, but matched every `.txt` file project-wide, including a real dependency file added
+  months later. `docker compose up -d --build api` would have failed immediately with a
+  "file not found" `COPY` error. Caught in review before running, not discovered via a
+  failed build. Fixed by scoping the gitignore rule to specific scratch paths and
+  force-adding `api/requirements.txt`.
+- **The global `/anomalies` feed has no supporting index.**
+  `anomalies_user_detected_at_idx` covers `(user_id, detected_at)` for the per-user endpoint
+  only; the global feed's `ORDER BY detected_at DESC, anomaly_id DESC` with no `user_id`
+  filter does a full sort at current scale. Not a problem yet, but worth adding
+  `CREATE INDEX ON transactions.anomalies (detected_at DESC, anomaly_id DESC)` as a
+  migration before Step 11's benchmarks run against it, so the benchmark isn't
+  inadvertently measuring an avoidable full-table sort.
 
 ---
 
