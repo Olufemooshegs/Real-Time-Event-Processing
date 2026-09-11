@@ -3,3 +3,6 @@
 # scratch/debug output
 *.txt
 *.log
+
+# Dependency manifests must be committed so the API image can be reproduced.
+!api/requirements.txt
