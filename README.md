@@ -1,6 +1,6 @@
 # Real-Time Event Processing & Analytics Platform
 
-Status: **in progress — Step 9 failure matrix procedures ready; runtime results pending independent verification (see docs/architecture-design-doc.md for the full plan)**
+Status: **in progress — Step 9 Scenario 1 (Kafka broker failure) closed and verified; Scenarios 2-5 pending (see docs/architecture-design-doc.md for the full plan)**
 
 This README is updated after each step with what's actually running and verified, not what's
 planned. If something isn't listed under "What's running" below, it doesn't exist yet.
@@ -53,6 +53,65 @@ Simpler single-broker dev setup. No operational reason to introduce Zookeeper at
   behavior on a narrow structured key space, not a code bug — producer send-side logic was
   checked directly and ruled out. No mitigation decided yet (larger pool size vs.
   non-sequential IDs vs. accepting the skew as realistic).
+- **`restart-strategy` was silently non-functional from the moment it was written, until
+  fixed during Step 9.** Flink 1.19 replaced the old flat `flink-conf.yaml` format with a
+  hierarchical `config.yaml`. The `FLINK_PROPERTIES` block in `docker-compose.yml` for both
+  `jobmanager` and `taskmanager` set a bare scalar key, `restart-strategy: fixed-delay`,
+  alongside two nested keys, `restart-strategy.fixed-delay.attempts: 10` and
+  `restart-strategy.fixed-delay.delay: 5 s`. Under the hierarchical schema this is a direct
+  key-schema collision (`restart-strategy` cannot be both a plain string and a parent map in
+  the same document), and the config loader resolved it by keeping the scalar and silently
+  discarding the two nested keys, with no warning printed anywhere at container startup,
+  in `docker compose logs`, or in the JobManager's own startup log. The job ran with
+  Flink's hardcoded library default instead: `FixedDelayRestartBackoffTimeStrategy`,
+  1 restart attempt, 1000ms delay. This was never caught by Step 8's kill test, because
+  that test kills and recovers the TaskManager within a single checkpoint cycle, a case
+  the 1-attempt default happens to tolerate. It surfaced for the first time during Step 9's
+  Kafka broker-failure scenario, where the job's actual restart behavior mattered.
+
+  **How it was found:** the JobManager's REST API (`GET /jobs/<id>/config`) reported
+  `"restart-strategy": "Cluster level default restart strategy"`, which is uninformative on
+  its own (it just means "look at the cluster config," not what that config actually is).
+  The real evidence came from the exception thrown on job failure, which names its own
+  parameters directly:
+  `org.apache.flink.runtime.JobException: Recovery is suppressed by
+  FixedDelayRestartBackoffTimeStrategy(maxNumberRestartAttempts=1, backoffTimeMS=1000)`.
+  Those numbers don't match the 10/5000 configured in `docker-compose.yml`, which is what
+  exposed the bug. Cross-checking `docker compose exec jobmanager cat
+  /opt/flink/conf/config.yaml` directly confirmed it: the file contained a bare
+  `restart-strategy: fixed-delay` line followed immediately by an unrelated top-level
+  `state:` key, with no nested `fixed-delay: {attempts, delay}` block anywhere in the file.
+  Checking `docker compose exec jobmanager env | grep -i restart` was a red herring at
+  first, since the container's own environment variables *did* show the correct values
+  (`restart-strategy: fixed-delay`, `restart-strategy.fixed-delay.attempts: 10`,
+  `restart-strategy.fixed-delay.delay: 5 s`) — those are the raw `FLINK_PROPERTIES`
+  env-var contents before Flink's own config-file writer parses and collapses them into
+  `config.yaml`, which is where the actual collision happened. This distinction (env vars
+  looking correct while the parsed config file silently drops data) is itself worth
+  remembering: checking the input to a config loader is not the same as checking its
+  output.
+
+  **Fix:** changed the bare key from `restart-strategy: fixed-delay` to
+  `restart-strategy.type: fixed-delay` in both services' `FLINK_PROPERTIES` blocks in
+  `docker-compose.yml`, so nothing collides with the nested `fixed-delay.attempts`/
+  `fixed-delay.delay` keys. Rebuilt both images (`docker compose up -d --build jobmanager
+  taskmanager`), then confirmed the generated `config.yaml` produced a proper nested
+  block:
+
+  Confirmed the fix actually took effect at runtime, not just on disk, by forcing a second
+  real job failure and reading the exception it produced:
+  `FixedDelayRestartBackoffTimeStrategy(maxNumberRestartAttempts=10, backoffTimeMS=5000)`.
+  The timing corroborates this independently: the job was first observed in `RESTARTING`
+  state at 08:47:09 UTC and reached terminal `FAILED` at 08:48:00 UTC, a 51-second gap that
+  matches 10 attempts at a 5-second delay almost exactly.
+
+  **Why this matters beyond the one config line:** every restart-strategy assumption made
+  earlier in this project, including the ~50-second survivable-outage-window reasoning in
+  `docs/architecture-design-doc.md` Section 5, was written against a restart strategy that
+  was never actually running. The pipeline's real fault-tolerance behavior only started
+  matching its documented design once this was fixed, midway through Step 9. Full
+  before/after evidence, including the forced-failure test that proves the fix, is in
+  `docs/step9-failure-injection-matrix.md`.
 
 ---
 
@@ -300,12 +359,21 @@ and direct Kafka/Postgres queries.
 
 ## Step 9 failure-injection matrix
 
+## Step 9 failure-injection matrix
+
 The five rerunnable procedures are documented in
 [`docs/step9-failure-injection-matrix.md`](docs/step9-failure-injection-matrix.md): Kafka
 broker loss, producer restart, Flink-to-Kafka network interruption, Postgres outage, and
-consumer restart with offset-reset comparison. They require real before/after offset and
-Postgres reconciliation; no projected recovery result is recorded here.
+consumer restart with offset-reset comparison.
 
+**Scenario 1 (Kafka broker failure) is closed**, with real evidence and five distinct
+findings, the headline one being that a config bug had silently disabled the intended
+10-attempt/5s restart strategy since it was first written, and that the pipeline's actual
+exactly-once guarantee across a hard failure comes from the Postgres idempotent upsert,
+not from Flink's own checkpoint recovery. Full detail in the linked doc.
+
+Scenarios 2-5 require real before/after offset and Postgres reconciliation; no projected
+recovery result is recorded here until they're run.
 ---
 
 ## Development workflow notes
