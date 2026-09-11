@@ -132,6 +132,77 @@ event-upsert uniqueness, window updates, and diagnostic append duplicates separa
 
 ## Results status
 
-This document defines the procedures and evidence fields. It does not claim recovery,
-loss, or duplicate counts until each scenario has been run against the live Codespaces
-stack and its Kafka/Postgres evidence reviewed.
+## Results
+
+### Scenario 1: Kafka broker failure — closed
+
+Run against the live Codespaces stack on 2026-09-11, three attempts, evidence in
+`step9-results/kafka-broker-failure-*`.
+
+**Pre-existing bug found and fixed before this scenario could produce a meaningful result.**
+Flink 1.19's `config.yaml` uses a hierarchical schema. The `docker-compose.yml`
+`FLINK_PROPERTIES` block set both a bare `restart-strategy: fixed-delay` scalar and nested
+`restart-strategy.fixed-delay.attempts` / `.delay` keys. Under the new schema these collide:
+`restart-strategy` cannot simultaneously be a plain string and a map. The loader kept the
+scalar and silently dropped the nested attempts/delay, with no warning in any log. The job
+ran with Flink's hardcoded library default (`FixedDelayRestartBackoffTimeStrategy`,
+1 attempt, 1000ms delay) instead of the intended 10 attempts / 5s delay, confirmed by the
+exact parameters named in the `Recovery is suppressed by...` exception on the first kill
+test. Every restart-strategy assumption made before this point, including the Section 5
+design doc's ~50-second retry budget, was never actually in effect.
+
+**Fix:** `restart-strategy: fixed-delay` changed to `restart-strategy.type: fixed-delay` in
+both `jobmanager` and `taskmanager` `FLINK_PROPERTIES` blocks, so nothing collides with the
+nested keys. Confirmed via `config.yaml` producing a proper nested block
+(`restart-strategy: { type: fixed-delay, fixed-delay: { attempts: 10, delay: 5s } }`) and,
+later, via the exact exception on a second forced failure naming
+`maxNumberRestartAttempts=10, backoffTimeMS=5000`.
+
+**Finding 1 — Kafka-outage recovery is data-dependent, not deterministic.** With only a
+5% duplicate rate and no late/malformed traffic, killing the broker for several minutes
+never produced a single task failure. The job stayed `RUNNING` throughout, its `KafkaSource`
+consumer silently absorbed the outage via its own internal client reconnect logic, and the
+Postgres event count resumed climbing automatically once the broker came back (129,162 ->
+135,336 across the recovery window), with zero restarts and zero manual intervention.
+
+**Finding 2 — with dead-letter/late-topic writes forced (`--late-rate 0.3
+--malformed-rate 0.2`), the outage does eventually cause a hard failure, but only after a
+~120-second delay**, not immediately. This lines up with Kafka producer's default
+`delivery.timeout.ms` of 120,000ms: the dead-letter/late sink's producer connection,
+already open before the kill, only surfaced a hard error once its internal delivery
+timeout was exhausted (`No resolvable bootstrap urls given in bootstrap.servers`,
+raised while attempting to (re)construct the producer). First `RESTARTING` state observed
+122 seconds after the kill.
+
+**Finding 3 — the corrected 10-attempt/5s restart strategy gives the job roughly 50
+seconds of retry budget before giving up permanently.** Timestamps confirm this precisely:
+`RESTARTING` first observed at 08:47:09 UTC, terminal `FAILED` at 08:48:00 UTC, a 51-second
+gap matching 10 x 5s almost exactly. Kafka was down far longer than that in this test, so
+the retry budget was always going to be exhausted; this defines the actual survivable
+outage window for this pipeline as configured: **under a minute, self-healing; over a
+minute, requires manual resubmission.**
+
+**Finding 4 — a terminally `FAILED` job is not resupervised.** Flink does not restart a
+job that has exhausted its configured restart attempts; it stays down indefinitely until
+someone runs `flink run` again. There is no external supervisor (no Kubernetes restart
+policy, no `restart: unless-stopped`-equivalent at the Flink job level) in this setup.
+
+**Finding 5 — end-to-end exactly-once across this outage was delivered by the Postgres
+idempotent upsert, not by Flink's checkpoint recovery.** The resubmission after the
+terminal failure was a plain `flink run -py ...` with no `-s <savepoint path>`, so it
+started with completely empty deduplication state, not a resumed checkpoint. Despite that,
+`select count(*), count(distinct event_id) from transactions.events` returned
+`162350 | 162350` after resubmission and full backlog drain: zero duplicate rows. This
+confirms the design doc's Section 5 claim in practice, and sharpens it: Flink's
+`EXACTLY_ONCE` checkpointing protects internal state across a task failure *within* a
+running job's lifetime. It provides no protection across a full job termination and
+manual cold resubmission. The absence of duplicates here is entirely attributable to the
+Step 7 upsert-on-`event_id` sink, independent of Flink's own recovery mechanism.
+
+RF=1 still means no Kafka-level fault tolerance was or could be demonstrated by this test;
+the finding here is about Flink's and the pipeline's behavior around a broker outage, not
+about Kafka surviving one.
+
+### Scenarios 2-5
+
+Not yet run. Procedures above remain accurate and unchanged.
