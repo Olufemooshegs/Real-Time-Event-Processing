@@ -15,13 +15,14 @@ planned. If something isn't listed under "What's running" below, it doesn't exis
   and anomaly records.
 - **Flink**, with validation, deduplication, event-time windows, deterministic anomalies,
   and direct Postgres sinks.
+- **FastAPI analytics API**, read-only over the existing Postgres tables, with asyncpg
+  pooling and cursor-based pagination on port 8000.
 - **Async transaction producer** (`producers/transaction_generator/main.py`, `aiokafka`),
   running as a plain local Python process, not containerized (deliberate choice for this
   phase — see "Decisions" below).
 
 ## What's explicitly NOT built yet
 
-- FastAPI analytics API
 - ClickHouse
 - Prometheus / Grafana
 - Failure injection tooling
@@ -374,6 +375,23 @@ not from Flink's own checkpoint recovery. Full detail in the linked doc.
 
 Scenarios 2-5 require real before/after offset and Postgres reconciliation; no projected
 recovery result is recorded here until they're run.
+---
+
+## Step 10 analytics API
+
+The read-only API lives under `api/` and is exposed by Compose on port 8000. It uses raw
+parameterized asyncpg queries, validates cursor and anomaly filters as client errors, and
+returns HTTP 503 when the small development pool cannot be acquired within two seconds.
+It does not create or modify database tables and has no write endpoints.
+
+```bash
+make up
+make api-health
+```
+
+Available resources are `/users/{user_id}/transactions`,
+`/users/{user_id}/aggregates`, `/users/{user_id}/anomalies`, and global `/anomalies`.
+
 ---
 
 ## Development workflow notes
