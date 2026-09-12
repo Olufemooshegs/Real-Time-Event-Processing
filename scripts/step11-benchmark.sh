@@ -20,7 +20,7 @@ command -v python3 >/dev/null || die "python3 is required"
 offsets() { docker compose exec -T kafka kafka-get-offsets --bootstrap-server kafka:29092 --topic transactions.raw; }
 total() { awk -F: '{sum += $NF} END {print sum+0}' "$1"; }
 pg_count() { docker compose exec -T postgres sh -c 'psql -At -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "select count(*) from transactions.events"' | tr -d '[:space:]'; }
-lag() { docker compose exec -T kafka kafka-consumer-groups --bootstrap-server kafka:29092 --describe --group "$GROUP" 2>/dev/null | awk 'NR>1 && $5 ~ /^[0-9]+$/ {sum += $5} END {print sum+0}' || true; }
+lag() { docker compose exec -T kafka kafka-consumer-groups --bootstrap-server kafka:29092 --describe --group "$GROUP" 2>/dev/null | awk 'NR>1 && $6 ~ /^[0-9]+$/ {sum += $6} END {print sum+0}' || true; }
 job_id() { curl --fail --silent "$FLINK_URL/jobs/overview" | python3 -c 'import json,sys; print(next((j["jid"] for j in json.load(sys.stdin).get("jobs",[]) if j.get("state")=="RUNNING"),""))'; }
 
 discover() {
