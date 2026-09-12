@@ -8,7 +8,7 @@ import sys
 
 
 def main() -> None:
-    directory, rate, duration, start_ms, end_ms, steady = sys.argv[1:]
+    directory, rate, duration, start_ms, end_ms, steady, drain_end_ms = sys.argv[1:]
     root = pathlib.Path(directory)
     raw_ids: set[str] = set()
     for line in (root / "raw-events.jsonl").read_text(errors="replace").splitlines():
@@ -42,7 +42,7 @@ def main() -> None:
     for checkpoint in checkpoints:
         trigger = checkpoint.get("trigger_timestamp")
         acknowledged = checkpoint.get("latest_ack_timestamp")
-        if trigger is not None and acknowledged is not None and int(start_ms) <= int(trigger) <= int(end_ms):
+        if trigger is not None and acknowledged is not None and int(start_ms) <= int(trigger) <= int(drain_end_ms):
             durations.append(int(acknowledged) - int(trigger))
     result = {
         "requested_rate": int(rate),
