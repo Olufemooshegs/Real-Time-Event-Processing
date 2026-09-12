@@ -62,6 +62,7 @@ poll() {
 copy_raw() {
   local topic="$1" before="$2" after="$3" output="$4"; : > "$output"
   for p in $(seq 0 5); do
+    local start end count
     start=$(awk -F: -v p="$p" '$2==p{print $NF}' "$before"); end=$(awk -F: -v p="$p" '$2==p{print $NF}' "$after"); start=${start:-0}; end=${end:-0}; count=$((end-start)); ((count>0)) || continue
     docker compose exec -T kafka kafka-console-consumer --bootstrap-server kafka:29092 --topic "$topic" --partition "$p" --offset "$start" --max-messages "$count" --timeout-ms 30000 2>/dev/null >> "$output" || true
   done
@@ -115,6 +116,7 @@ for rate in $RATES; do
   offsets > "$dir/raw-after.offsets"; docker compose exec -T kafka kafka-get-offsets --bootstrap-server kafka:29092 --topic transactions.deadletter > "$dir/deadletter-after.offsets"; copy_raw transactions.raw "$dir/raw-before.offsets" "$dir/raw-after.offsets" "$dir/raw-events.jsonl"; copy_raw transactions.deadletter "$dir/deadletter-before.offsets" "$dir/deadletter-after.offsets" "$dir/deadletters.jsonl"; reconcile "$dir"
   curl --fail --silent "$FLINK_URL/jobs/$jid/checkpoints" > "$dir/checkpoints.json"
   docker compose exec -T postgres sh -c "psql -At -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -c \"SELECT json_build_object('event_to_received_ms', json_build_object('p50', percentile_cont(0.50) within group (order by extract(epoch from (received_at-event_time))*1000), 'p95', percentile_cont(0.95) within group (order by extract(epoch from (received_at-event_time))*1000), 'p99', percentile_cont(0.99) within group (order by extract(epoch from (received_at-event_time))*1000)), 'ingest_to_received_ms', json_build_object('p50', percentile_cont(0.50) within group (order by extract(epoch from (received_at-ingest_time))*1000), 'p95', percentile_cont(0.95) within group (order by extract(epoch from (received_at-ingest_time))*1000), 'p99', percentile_cont(0.99) within group (order by extract(epoch from (received_at-ingest_time))*1000))) FROM transactions.events WHERE event_time BETWEEN to_timestamp($start/1000.0) AND to_timestamp($end/1000.0)\"" > "$dir/latency.json"
+  echo "[DEBUG] start=$start end=$end diff_ms=$((end - start))" >&2
   python3 scripts/step11_metrics.py "$dir" "$rate" "$DURATION" "$start" "$end" "$steady"
 done
 
