@@ -30,7 +30,7 @@ base,jid,out=sys.argv[1:]
 def get(path):
     with urllib.request.urlopen(base+path,timeout=10) as r: return json.load(r)
 found=[]
-for v in get(f'/jobs/{jid}/vertices').get('vertices',[]):
+for v in get(f'/jobs/{jid}').get('vertices',[]):
     metrics=get(f"/jobs/{jid}/vertices/{v['id']}/metrics")
     ids=[m['id'] for m in metrics if any(x in m['id'].lower() for x in ('lag','pending','backlog','emit'))]
     found.append({'vertex_id':v['id'],'name':v.get('name'),'metric_ids':ids})
