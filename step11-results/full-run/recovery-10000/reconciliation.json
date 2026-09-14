@@ -1,0 +1,8 @@
+{
+  "raw_unique_event_ids": 54433,
+  "landed_event_ids": 1652791,
+  "deadletter_event_ids": 0,
+  "unaccounted_event_ids": 0,
+  "unaccounted_ids": [],
+  "duplicate_event_id_rows": 0
+}

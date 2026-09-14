@@ -1,0 +1,34 @@
+[
+  {
+    "vertex_id": "cbc357ccb763df2852fee8c4fc7d55f2",
+    "name": "Source: transactions.raw source -> PROCESS -> (Map -> Sink: Writer -> Sink: Committer, _stream_key_by_map_operator)",
+    "metric_ids": [
+      "0.Source__transactions_raw_source.currentEmitEventTimeLag",
+      "1.Sink__Committer.pendingCommittables",
+      "1.Source__transactions_raw_source.currentEmitEventTimeLag",
+      "0.Source__transactions_raw_source.KafkaSourceReader.KafkaConsumer.records-lag-max",
+      "1.Source__transactions_raw_source.KafkaSourceReader.KafkaConsumer.records-lag-max",
+      "0.Sink__Committer.pendingCommittables",
+      "1.Source__transactions_raw_source.pendingRecords",
+      "0.Source__transactions_raw_source.pendingRecords"
+    ]
+  },
+  {
+    "vertex_id": "a944e18df672eb7dcc0d1f612ff7ddbb",
+    "name": "KEYED PROCESS -> (Timestamps/Watermarks -> PROCESS -> (Map -> (Sink: Writer -> Sink: Committer, Map -> Sink: Print to Std. Out), _stream_key_by_map_operator, _stream_key_by_map_operator), Map -> Sink: Print to Std. Out, PROCESS)",
+    "metric_ids": [
+      "1.Sink__Committer.pendingCommittables",
+      "0.Sink__Committer.pendingCommittables"
+    ]
+  },
+  {
+    "vertex_id": "040245c65139392f789b34758f0b88a6",
+    "name": "TumblingEventTimeWindows -> (Map -> Sink: Print to Std. Out, PROCESS)",
+    "metric_ids": []
+  },
+  {
+    "vertex_id": "d96cf38988d3a0426b6d50121d70bfd4",
+    "name": "KEYED PROCESS -> (Map -> Sink: Print to Std. Out, PROCESS)",
+    "metric_ids": []
+  }
+]

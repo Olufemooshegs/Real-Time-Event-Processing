@@ -1,0 +1,13 @@
+{"timestamp":"2026-09-13T09:19:58.061Z","phase":"recovery","raw_offset_total":1281436,"postgres_events":1230270,"consumer_group_lag":31167}
+{"timestamp":"2026-09-13T09:20:08.284Z","phase":"recovery","raw_offset_total":1281436,"postgres_events":1233270,"consumer_group_lag":31167}
+{"timestamp":"2026-09-13T09:20:18.577Z","phase":"recovery","raw_offset_total":1281436,"postgres_events":1237270,"consumer_group_lag":26167}
+{"timestamp":"2026-09-13T09:20:28.480Z","phase":"recovery","raw_offset_total":1281436,"postgres_events":1240270,"consumer_group_lag":21167}
+{"timestamp":"2026-09-13T09:20:39.397Z","phase":"recovery","raw_offset_total":1281436,"postgres_events":1243270,"consumer_group_lag":21167}
+{"timestamp":"2026-09-13T09:20:48.616Z","phase":"recovery","raw_offset_total":1281436,"postgres_events":1247270,"consumer_group_lag":16167}
+{"timestamp":"2026-09-13T09:20:58.997Z","phase":"recovery","raw_offset_total":1281436,"postgres_events":1250270,"consumer_group_lag":14167}
+{"timestamp":"2026-09-13T09:21:08.758Z","phase":"recovery","raw_offset_total":1281436,"postgres_events":1254391,"consumer_group_lag":9167}
+{"timestamp":"2026-09-13T09:21:18.019Z","phase":"recovery","raw_offset_total":1281436,"postgres_events":1257868,"consumer_group_lag":4569}
+{"timestamp":"2026-09-13T09:21:27.605Z","phase":"recovery","raw_offset_total":1281436,"postgres_events":1259437,"consumer_group_lag":0}
+{"timestamp":"2026-09-13T09:21:35.916Z","phase":"recovery","raw_offset_total":1281436,"postgres_events":1259437,"consumer_group_lag":0}
+{"timestamp":"2026-09-13T09:21:44.422Z","phase":"recovery","raw_offset_total":1281436,"postgres_events":1259437,"consumer_group_lag":0}
+{"timestamp":"2026-09-13T09:21:52.694Z","phase":"recovery","raw_offset_total":1281436,"postgres_events":1259437,"consumer_group_lag":0}
