@@ -16,3 +16,9 @@ step11-results/*/*/metrics-live-*.json
 step11-results/*/*/metrics-drain-*.json
 step11-results/*/*/metrics-recovery-*.json
 step11-results/full-run.pid
+step12-results/*/events.ids
+step12-results/*/duplicate.ids
+step12-results/*/backlog-isolation/*/events.ids
+step12-results/*/backlog-isolation/*/metrics-live-*.json
+step12-results/*/backlog-isolation/*/metrics-drain-*.json
+step12-results/*/backlog-isolation/*/metrics-recovery-*.json
