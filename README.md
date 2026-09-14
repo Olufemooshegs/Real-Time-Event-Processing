@@ -1,6 +1,8 @@
 # Real-Time Event Processing & Analytics Platform
 
-Status: **in progress — Step 9 Scenario 1 (Kafka broker failure) closed and verified; Scenarios 2-5 pending (see docs/architecture-design-doc.md for the full plan)**
+Status: **in progress — Steps 1-8 and Step 9 Scenario 1 closed and verified. Step 10
+(analytics API) closed. Step 11 (benchmark harness) closed with a headline finding on
+system behavior under load. Step 9 Scenarios 2-5 and Step 12 remain.**
 
 This README is updated after each step with what's actually running and verified, not what's
 planned. If something isn't listed under "What's running" below, it doesn't exist yet.
@@ -15,8 +17,10 @@ planned. If something isn't listed under "What's running" below, it doesn't exis
   and anomaly records.
 - **Flink**, with validation, deduplication, event-time windows, deterministic anomalies,
   and direct Postgres sinks.
-- **FastAPI analytics API**, read-only over the existing Postgres tables, with asyncpg
-  pooling and cursor-based pagination on port 8000.
+- **FastAPI analytics API** (`api/`), containerized, read-only endpoints over the Step 7
+  Postgres schema: paginated user transactions/aggregates/anomalies plus a global anomaly
+  feed, keyset pagination throughout, fail-fast 503 on pool exhaustion rather than queueing
+  silently.
 - **Async transaction producer** (`producers/transaction_generator/main.py`, `aiokafka`),
   running as a plain local Python process, not containerized (deliberate choice for this
   phase — see "Decisions" below).
@@ -25,8 +29,9 @@ planned. If something isn't listed under "What's running" below, it doesn't exis
 
 - ClickHouse
 - Prometheus / Grafana
-- Failure injection tooling
-- Benchmarking harness
+- Step 12 end-to-end integration test
+- Step 9 Scenarios 2-5 (producer restart, Flink-to-Kafka network interruption, Postgres
+  outage, consumer restart/offset-reset)
 
 ---
 
@@ -96,8 +101,8 @@ Simpler single-broker dev setup. No operational reason to introduce Zookeeper at
   `restart-strategy.type: fixed-delay` in both services' `FLINK_PROPERTIES` blocks in
   `docker-compose.yml`, so nothing collides with the nested `fixed-delay.attempts`/
   `fixed-delay.delay` keys. Rebuilt both images (`docker compose up -d --build jobmanager
-  taskmanager`), then confirmed the generated `config.yaml` produced a proper nested
-  block:
+  taskmanager`), then confirmed the generated `config.yaml` produced a proper nested block:
+  `restart-strategy: { type: fixed-delay, fixed-delay: { attempts: '10', delay: 5s } }`.
 
   Confirmed the fix actually took effect at runtime, not just on disk, by forcing a second
   real job failure and reading the exception it produced:
@@ -113,6 +118,21 @@ Simpler single-broker dev setup. No operational reason to introduce Zookeeper at
   matching its documented design once this was fixed, midway through Step 9. Full
   before/after evidence, including the forced-failure test that proves the fix, is in
   `docs/step9-failure-injection-matrix.md`.
+
+- **`.gitignore`'s blanket `*.txt` rule silently excluded `api/requirements.txt` from the
+  Step 10 commit.** The rule was written to keep scratch/debug `.txt` output out of the
+  repo, but matched every `.txt` file project-wide, including a real dependency file added
+  months later. `docker compose up -d --build api` would have failed immediately with a
+  "file not found" `COPY` error. Caught in review before running, not discovered via a
+  failed build. Fixed by scoping the gitignore rule to specific scratch paths and
+  force-adding `api/requirements.txt`.
+- **The global `/anomalies` feed has no supporting index.**
+  `anomalies_user_detected_at_idx` covers `(user_id, detected_at)` for the per-user endpoint
+  only; the global feed's `ORDER BY detected_at DESC, anomaly_id DESC` with no `user_id`
+  filter does a full sort at current scale. Not a problem yet, but worth adding
+  `CREATE INDEX ON transactions.anomalies (detected_at DESC, anomaly_id DESC)` as a
+  migration before Step 11's benchmarks run against it, so the benchmark isn't
+  inadvertently measuring an avoidable full-table sort.
 
 ---
 
@@ -360,8 +380,6 @@ and direct Kafka/Postgres queries.
 
 ## Step 9 failure-injection matrix
 
-## Step 9 failure-injection matrix
-
 The five rerunnable procedures are documented in
 [`docs/step9-failure-injection-matrix.md`](docs/step9-failure-injection-matrix.md): Kafka
 broker loss, producer restart, Flink-to-Kafka network interruption, Postgres outage, and
@@ -391,6 +409,27 @@ make api-health
 
 Available resources are `/users/{user_id}/transactions`,
 `/users/{user_id}/aggregates`, `/users/{user_id}/anomalies`, and global `/anomalies`.
+
+---
+
+## Step 11 benchmark harness
+
+The benchmark harness is `scripts/step11-benchmark.sh`, with the procedure and artifact
+format documented in `docs/step11-benchmark-results.md`. It captures hardware context,
+measured Kafka throughput, consumer lag, discovered Flink metrics, checkpoint durations,
+separate latency percentiles, ID reconciliation, and a recovery run at the highest load
+level that stabilizes.
+
+**Closed, with a headline finding**: across 1,000-100,000 requested events/sec, the
+producer itself is the binding constraint at every level (achieved throughput never
+exceeds ~400/sec), and a sharp qualitative break occurs between 10,000 and 100,000
+requested — the drain loop stops reaching steady state, Flink's checkpoint history comes
+back completely empty, and latency roughly triples, all at the same transition. Four real
+bugs in the harness itself were found and fixed before these numbers could be trusted (bad
+awk column index, a nonexistent Flink REST endpoint, an unscoped bash variable silently
+clobbering timing data, and a checkpoint-history retention window mismatch). Full detail,
+including an important caveat about pre-existing Kafka backlog affecting the absolute
+latency figures, is in `docs/step11-benchmark-results.md`.
 
 ---
 
