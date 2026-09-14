@@ -1,4 +1,4 @@
-.PHONY: up down logs health postgres-migrate api-health step8-kill-test step11-benchmark topics-apply topic-create topic-describe flink-up flink-health flink-job-submit flink-logs flink-api-check flink-anomaly-api-check flink-jdbc-api-check
+.PHONY: up down logs health postgres-migrate api-health step8-kill-test step11-benchmark step12-integration-test topics-apply topic-create topic-describe flink-up flink-health flink-job-submit flink-logs flink-api-check flink-anomaly-api-check flink-jdbc-api-check
 
 up:
 	docker compose up -d
@@ -23,6 +23,9 @@ step8-kill-test:
 
 step11-benchmark:
 	bash scripts/step11-benchmark.sh
+
+step12-integration-test:
+	bash scripts/step12-integration-test.sh
 
 topics-apply:
 	bash scripts/apply-topics.sh infrastructure/kafka/topics.yml
