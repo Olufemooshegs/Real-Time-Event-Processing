@@ -39,25 +39,28 @@ PY
 }
 
 metric_snapshot() {
-  python3 - "$FLINK_URL" "$1" "$2" "$3" <<'PY'
+  python3 - "$FLINK_URL" "$1" "$2" "$3" "$4" <<'PY'
 import json,sys,urllib.parse,urllib.request
-base,jid,discovery,out=sys.argv[1:]; result=[]
+from datetime import datetime, timezone
+base,jid,discovery,phase,out=sys.argv[1:]; result=[]
 for v in json.load(open(discovery)):
   for metric in v['metric_ids']:
     try:
       q=urllib.parse.urlencode({'get':metric})
       with urllib.request.urlopen(f"{base}/jobs/{jid}/vertices/{v['vertex_id']}/metrics?{q}",timeout=10) as r: result.extend(json.load(r))
     except Exception as exc: result.append({'id':metric,'error':str(exc)})
-open(out,'w').write(json.dumps(result))
+line = {"timestamp": datetime.now(timezone.utc).isoformat(), "phase": phase, "metrics": result}
+with open(out, 'a') as f: f.write(json.dumps(line) + "\n")
 PY
 }
 
 poll() {
   local dir="$1" jid="$2" discovery="$3" phase="$4"; local file="$dir/raw-$phase.offsets"
-  offsets > "$file"; metric_snapshot "$jid" "$discovery" "$dir/metrics-$phase-$(date +%s).json"
+  offsets > "$file"; metric_snapshot "$jid" "$discovery" "$phase" "$dir/metrics.jsonl"
   printf '{"timestamp":"%s","phase":"%s","raw_offset_total":%s,"postgres_events":%s,"consumer_group_lag":%s}\n' \
     "$(date -u +%FT%T.%3NZ)" "$phase" "$(total "$file")" "$(pg_count)" "$(lag)" >> "$dir/polls.jsonl"
 }
+
 
 copy_raw() {
   local topic="$1" before="$2" after="$3" output="$4"; : > "$output"
@@ -69,10 +72,10 @@ copy_raw() {
 }
 
 reconcile() {
-  local dir="$1"
-  docker compose exec -T postgres sh -c 'psql -At -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "select event_id from transactions.events"' > "$dir/events.ids"
-  docker compose exec -T postgres sh -c 'psql -At -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "select event_id from transactions.events group by event_id having count(*)>1"' > "$dir/duplicate.ids"
-  : > "$dir/deadletters.jsonl"
+  local dir="$1" start_ms="$2" end_ms="$3"
+  docker compose exec -T postgres sh -c "psql -At -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -c \"select event_id from transactions.events where received_at between to_timestamp($start_ms/1000.0) and to_timestamp($end_ms/1000.0)\"" > "$dir/events.ids"
+  docker compose exec -T postgres sh -c "psql -At -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -c \"select event_id from transactions.events where received_at between to_timestamp($start_ms/1000.0) and to_timestamp($end_ms/1000.0) group by event_id having count(*)>1\"" > "$dir/duplicate.ids"
+  ...  : > "$dir/deadletters.jsonl"
   python3 - "$dir" <<'PY'
 import json,pathlib,sys
 d=pathlib.Path(sys.argv[1]); raw=set(); dead=set(); db={x.strip() for x in (d/'events.ids').read_text().splitlines() if x.strip()}
@@ -114,7 +117,9 @@ for rate in $RATES; do
   done
     drain_end="$(date +%s%3N)"
   steady=false; ((stable>=3)) && steady=true; $steady && best="$rate" || warn "rate $rate did not stabilize before timeout"
-  offsets > "$dir/raw-after.offsets"; docker compose exec -T kafka kafka-get-offsets --bootstrap-server kafka:29092 --topic transactions.deadletter > "$dir/deadletter-after.offsets"; copy_raw transactions.raw "$dir/raw-before.offsets" "$dir/raw-after.offsets" "$dir/raw-events.jsonl"; copy_raw transactions.deadletter "$dir/deadletter-before.offsets" "$dir/deadletter-after.offsets" "$dir/deadletters.jsonl"; reconcile "$dir"
+  reconcile "$dir" "$start" "$recovery_drain_end"
+  recovery_drain_end="$(date +%s%3N)"
+  offsets > "$dir/raw-after.offsets"; docker compose exec -T kafka kafka-get-offsets --bootstrap-server kafka:29092 --topic transactions.deadletter > "$dir/deadletter-after.offsets"; copy_raw transactions.raw "$dir/raw-before.offsets" "$dir/raw-after.offsets" "$dir/raw-events.jsonl"; copy_raw transactions.deadletter "$dir/deadletter-before.offsets" "$dir/deadletter-after.offsets" "$dir/deadletters.jsonl"; reconcile "$dir" "$start" "$recovery_drain_end"
   curl --fail --silent "$FLINK_URL/jobs/$jid/checkpoints" > "$dir/checkpoints.json"
   docker compose exec -T postgres sh -c "psql -At -U \"\$POSTGRES_USER\" -d \"\$POSTGRES_DB\" -c \"SELECT json_build_object('event_to_received_ms', json_build_object('p50', percentile_cont(0.50) within group (order by extract(epoch from (received_at-event_time))*1000), 'p95', percentile_cont(0.95) within group (order by extract(epoch from (received_at-event_time))*1000), 'p99', percentile_cont(0.99) within group (order by extract(epoch from (received_at-event_time))*1000)), 'ingest_to_received_ms', json_build_object('p50', percentile_cont(0.50) within group (order by extract(epoch from (received_at-ingest_time))*1000), 'p95', percentile_cont(0.95) within group (order by extract(epoch from (received_at-ingest_time))*1000), 'p99', percentile_cont(0.99) within group (order by extract(epoch from (received_at-ingest_time))*1000))) FROM transactions.events WHERE event_time BETWEEN to_timestamp($start/1000.0) AND to_timestamp($end/1000.0)\"" > "$dir/latency.json"
   python3 scripts/step11_metrics.py "$dir" "$rate" "$DURATION" "$start" "$end" "$steady" "$drain_end"
@@ -127,7 +132,7 @@ if [[ -n "$best" ]]; then
   sleep 20; kill_at="$(date +%s%3N)"; docker compose kill -s SIGKILL taskmanager; docker compose up -d taskmanager; wait "$producer" 2>/dev/null || true
   previous=-1; stable=0; deadline=$(( $(date +%s)+TIMEOUT ))
   while (( $(date +%s)<deadline )); do poll "$dir" "$jid" "$dir/metrics-discovery.json" recovery; now="$(pg_count)"; [[ "$now" == "$previous" ]] && stable=$((stable+1)) || stable=0; previous="$now"; if (( stable >= 3 )); then break; fi; sleep "$POLL"; done
-  offsets > "$dir/raw-after.offsets"; docker compose exec -T kafka kafka-get-offsets --bootstrap-server kafka:29092 --topic transactions.deadletter > "$dir/deadletter-after.offsets"; copy_raw transactions.raw "$dir/raw-before.offsets" "$dir/raw-after.offsets" "$dir/raw-events.jsonl"; copy_raw transactions.deadletter "$dir/deadletter-before.offsets" "$dir/deadletter-after.offsets" "$dir/deadletters.jsonl"; reconcile "$dir"
+  offsets > "$dir/raw-after.offsets"; docker compose exec -T kafka kafka-get-offsets --bootstrap-server kafka:29092 --topic transactions.deadletter > "$dir/deadletter-after.offsets"; copy_raw transactions.raw "$dir/raw-before.offsets" "$dir/raw-after.offsets" "$dir/raw-events.jsonl"; copy_raw transactions.deadletter "$dir/deadletter-before.offsets" "$dir/deadletter-after.offsets" "$dir/deadletters.jsonl"; reconcile "$dir" "$start" "$drain_end"
   recovery_at="$(date +%s%3N)"; printf '{"requested_rate":%s,"steady_state":%s,"poll_count":%s,"kill_at_ms":%s,"stabilized_at_ms":%s,"recovery_time_ms":%s}\n' "$best" "$((stable>=3))" "$(wc -l < "$dir/polls.jsonl")" "$kill_at" "$recovery_at" "$((recovery_at-kill_at))" > "$dir/recovery.json"
 else
   warn "No requested level stabilized; recovery scenario was not run."
