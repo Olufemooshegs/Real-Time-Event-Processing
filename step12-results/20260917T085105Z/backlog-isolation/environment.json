@@ -1,0 +1,9 @@
+{
+  "codespaces_environment": {
+    "CODESPACE_NAME": "glowing-carnival-4jjv997xr5v4cjw57",
+    "CODESPACES": "true"
+  },
+  "machine_type_note": "Fill manually from Codespace settings if metadata is absent.",
+  "environment_text": "environment.txt",
+  "flink_config": "flink-config.yaml"
+}

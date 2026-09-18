@@ -51,7 +51,7 @@ flink-health:
 	exit 1
 
 flink-job-submit:
-	docker compose exec -T jobmanager flink run \
+	docker compose exec -T jobmanager flink run -d \
 		-pyclientexec /usr/bin/python3 \
 		-pyexec /usr/bin/python3 \
 		-py /opt/flink/usrlib/jobs/validation_dedup_job.py

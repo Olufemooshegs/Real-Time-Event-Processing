@@ -1,0 +1,30 @@
+{
+  "transactions": {
+    "first_page_items": 3,
+    "second_page_items": 3,
+    "next_cursor_present": true
+  },
+  "aggregates": {
+    "first_page_items": 3,
+    "second_page_items": 3,
+    "next_cursor_present": true
+  },
+  "user_anomalies": {
+    "first_page_items": 3,
+    "second_page_items": 3,
+    "next_cursor_present": true
+  },
+  "global_anomalies": {
+    "first_page_items": 3,
+    "second_page_items": 3,
+    "next_cursor_present": true
+  },
+  "content_match": {
+    "event_ids": [
+      "aa1ddb0a-505b-4315-87cb-c511bc0aaf14",
+      "4bcdd4af-e17b-4002-a433-e93b94ec747a",
+      "ee141ce2-23a6-49da-bd16-0810e17cf512"
+    ],
+    "postgres_rows_matched": true
+  }
+}

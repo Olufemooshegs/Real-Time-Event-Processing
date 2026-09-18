@@ -18,7 +18,11 @@ reconcile() { local start="$1" end="$2"; docker compose exec -T postgres sh -c "
 bash scripts/step12-reset-kafka-backlog.sh
 make flink-health
 make flink-job-submit > "$OUT/flink-submit.log" 2>&1
-for attempt in $(seq 1 30); do docker compose exec -T jobmanager flink list > "$OUT/flink-list.txt" 2>&1 || true; grep -q RUNNING "$OUT/flink-list.txt" && break; sleep 2; done
+for attempt in $(seq 1 30); do
+  docker compose exec -T jobmanager flink list > "$OUT/flink-list.txt" 2>&1 || true
+  if grep -q RUNNING "$OUT/flink-list.txt"; then break; fi
+  sleep 2
+done
 grep -q RUNNING "$OUT/flink-list.txt" || die "Flink job did not reach RUNNING"
 
 printf '%q ' "${PROFILE[@]}" > "$OUT/producer-profile.txt"; printf '\n' >> "$OUT/producer-profile.txt"

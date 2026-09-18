@@ -1,0 +1,14 @@
+{
+  "step11_artifact": "step11-results/full-run/recovery-5000/recovery.json",
+  "step11_requested_rate": 5000,
+  "step11_kill_at_ms": 1789291095724,
+  "step11_stabilized_at_ms": 1789291333052,
+  "step11_recovery_time_ms": 237328,
+  "definition": "The artifact measures SIGKILL to the end of the poll-to-stability drain, not merely a container restart.",
+  "first_observed_postgres_growth": {
+    "timestamp": "2026-09-13T09:20:08.284Z",
+    "postgres_events": 1233270
+  },
+  "status": "inconclusive",
+  "comparison": "Step 8's checked-in procedure documents correctness results but no measured recovery duration, so degradation cannot be calculated without its original run artifact. The Step 11 artifact still records the full kill-to-stability duration and the first observed later growth poll."
+}

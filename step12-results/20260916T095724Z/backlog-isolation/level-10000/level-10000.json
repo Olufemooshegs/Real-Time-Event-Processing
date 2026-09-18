@@ -1,0 +1,187 @@
+{
+  "requested_rate": 10000,
+  "duration_seconds": 120,
+  "producer_sent_last_summary": 43834,
+  "raw_offset_delta": 43834,
+  "actual_throughput_events_per_second": 343.6505323235649,
+  "steady_state": true,
+  "raw_unique_event_ids": 43834,
+  "landed_event_ids": 43834,
+  "deadletter_event_ids": 0,
+  "unaccounted_event_ids": 0,
+  "unaccounted_ids": [],
+  "duplicate_event_id_rows": 0,
+  "checkpoint_duration_ms": {
+    "count": 8,
+    "min": 104,
+    "avg": 119.5,
+    "max": 148,
+    "p95": 137
+  },
+  "latency_percentiles_ms_file": "latency.json",
+  "latency_percentiles_ms": {
+    "event_to_received_ms": {
+      "p50": 37296.0935,
+      "p95": 66914.4253,
+      "p99": 71660.67007999998
+    },
+    "ingest_to_received_ms": {
+      "p50": 37296.0935,
+      "p95": 66914.4253,
+      "p99": 71660.67007999998
+    }
+  },
+  "polls": [
+    {
+      "timestamp": "2026-09-16T10:05:55.660Z",
+      "phase": "live",
+      "raw_offset_total": 43833,
+      "postgres_events": 1700134,
+      "consumer_group_lag": 1499
+    },
+    {
+      "timestamp": "2026-09-16T10:06:06.690Z",
+      "phase": "live",
+      "raw_offset_total": 47888,
+      "postgres_events": 1701051,
+      "consumer_group_lag": 5451
+    },
+    {
+      "timestamp": "2026-09-16T10:06:16.744Z",
+      "phase": "live",
+      "raw_offset_total": 51800,
+      "postgres_events": 1703593,
+      "consumer_group_lag": 9548
+    },
+    {
+      "timestamp": "2026-09-16T10:06:28.738Z",
+      "phase": "live",
+      "raw_offset_total": 55518,
+      "postgres_events": 1705593,
+      "consumer_group_lag": 9778
+    },
+    {
+      "timestamp": "2026-09-16T10:06:40.630Z",
+      "phase": "live",
+      "raw_offset_total": 59311,
+      "postgres_events": 1708096,
+      "consumer_group_lag": 13417
+    },
+    {
+      "timestamp": "2026-09-16T10:06:50.533Z",
+      "phase": "live",
+      "raw_offset_total": 63125,
+      "postgres_events": 1710620,
+      "consumer_group_lag": 12368
+    },
+    {
+      "timestamp": "2026-09-16T10:07:00.799Z",
+      "phase": "live",
+      "raw_offset_total": 66970,
+      "postgres_events": 1712704,
+      "consumer_group_lag": 16059
+    },
+    {
+      "timestamp": "2026-09-16T10:07:11.370Z",
+      "phase": "live",
+      "raw_offset_total": 70766,
+      "postgres_events": 1715620,
+      "consumer_group_lag": 15024
+    },
+    {
+      "timestamp": "2026-09-16T10:07:22.224Z",
+      "phase": "live",
+      "raw_offset_total": 74814,
+      "postgres_events": 1718620,
+      "consumer_group_lag": 19037
+    },
+    {
+      "timestamp": "2026-09-16T10:07:32.315Z",
+      "phase": "live",
+      "raw_offset_total": 78853,
+      "postgres_events": 1720620,
+      "consumer_group_lag": 18133
+    },
+    {
+      "timestamp": "2026-09-16T10:07:42.849Z",
+      "phase": "live",
+      "raw_offset_total": 82754,
+      "postgres_events": 1723620,
+      "consumer_group_lag": 21981
+    },
+    {
+      "timestamp": "2026-09-16T10:07:53.330Z",
+      "phase": "live",
+      "raw_offset_total": 86790,
+      "postgres_events": 1725620,
+      "consumer_group_lag": 20348
+    },
+    {
+      "timestamp": "2026-09-16T10:08:03.197Z",
+      "phase": "drain",
+      "raw_offset_total": 87214,
+      "postgres_events": 1728620,
+      "consumer_group_lag": 20348
+    },
+    {
+      "timestamp": "2026-09-16T10:08:13.336Z",
+      "phase": "drain",
+      "raw_offset_total": 87214,
+      "postgres_events": 1732620,
+      "consumer_group_lag": 15348
+    },
+    {
+      "timestamp": "2026-09-16T10:08:23.456Z",
+      "phase": "drain",
+      "raw_offset_total": 87214,
+      "postgres_events": 1735620,
+      "consumer_group_lag": 10348
+    },
+    {
+      "timestamp": "2026-09-16T10:08:34.033Z",
+      "phase": "drain",
+      "raw_offset_total": 87214,
+      "postgres_events": 1738418,
+      "consumer_group_lag": 10348
+    },
+    {
+      "timestamp": "2026-09-16T10:08:44.032Z",
+      "phase": "drain",
+      "raw_offset_total": 87214,
+      "postgres_events": 1742109,
+      "consumer_group_lag": 5550
+    },
+    {
+      "timestamp": "2026-09-16T10:08:53.969Z",
+      "phase": "drain",
+      "raw_offset_total": 87214,
+      "postgres_events": 1743968,
+      "consumer_group_lag": 2550
+    },
+    {
+      "timestamp": "2026-09-16T10:09:02.246Z",
+      "phase": "drain",
+      "raw_offset_total": 87214,
+      "postgres_events": 1743968,
+      "consumer_group_lag": 0
+    },
+    {
+      "timestamp": "2026-09-16T10:09:10.537Z",
+      "phase": "drain",
+      "raw_offset_total": 87214,
+      "postgres_events": 1743968,
+      "consumer_group_lag": 0
+    },
+    {
+      "timestamp": "2026-09-16T10:09:18.782Z",
+      "phase": "drain",
+      "raw_offset_total": 87214,
+      "postgres_events": 1743968,
+      "consumer_group_lag": 0
+    }
+  ],
+  "artifacts": {
+    "polls": "polls.jsonl",
+    "checkpoints": "checkpoints.json"
+  }
+}
