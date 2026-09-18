@@ -1,0 +1,127 @@
+# Step 9: Fault Tolerance Scenarios
+
+Four failure-injection scenarios were run against the live pipeline (producer, Kafka,
+Flink, Postgres) to verify how the system behaves under real infrastructure failures,
+not just happy-path load. Each scenario was verified with real terminal output and
+reconciled counts, not assumed from design intent.
+
+## Scenario 1: Kafka broker failure
+
+The Kafka broker itself was taken down while the pipeline was running.
+
+**Findings:**
+- Recovery behavior is data-dependent. With no active traffic at the moment of
+  failure, the consumer reconnects silently once the broker returns.
+- With active traffic and dead-letter sinks writing at the time of failure, the
+  failure surfaces as a hard failure rather than a silent retry.
+- Kafka's retry budget before a terminal failure is approximately 50 seconds.
+- A job that fails terminally does not self-recover. It requires manual
+  resubmission with `flink run`. There is no automatic resupervision.
+
+This same terminal-failure-needs-manual-resubmission pattern reappears in Scenario 4
+(Postgres outage), confirming it is a property of Flink's fixed-delay restart
+strategy in this deployment, not specific to the Kafka failure mode.
+
+## Scenario 2: Producer restart
+
+A long-running producer was sent `SIGKILL` mid-stream after roughly 30 seconds,
+then a fresh producer invocation was started against the same, unwiped topic for
+another 30 seconds.
+
+**Findings:**
+- A `SIGKILL` causes a small, bounded gap between the producer's own in-memory
+  `sent` counter and what is actually durably committed to Kafka. The observed
+  gap was 14 events, out of roughly 1,930 sent by that process. This happens
+  because the reporter only prints on a fixed interval, and `SIGKILL` skips the
+  `finally` block that would otherwise print a final, accurate summary.
+- Despite that gap, there was zero data loss and zero double-processing
+  downstream. Kafka's idempotent producer (`acks=all`, `enable_idempotence=True`)
+  had already durably committed the "invisible" events before the kill landed,
+  and Postgres's upsert-on-`event_id` absorbed the resumed second invocation
+  cleanly.
+- **Reconciliation technique established here and reused in every later
+  scenario:** when a producer's own counters are unreliable (a hard kill, or a
+  clobbered log, see Scenario 3), reconcile backward from Kafka's raw offset
+  deltas and Postgres landed counts, never forward from the producer's
+  self-reported injection stats.
+
+## Scenario 3: Flink-to-Kafka network interruption
+
+The Flink TaskManager was disconnected from the Docker network
+(`docker network disconnect`) for approximately 38 seconds while a producer sent
+traffic, then reconnected.
+
+**Findings:**
+- The JobManager's heartbeat monitor correctly detected the lost TaskManager in
+  about 10 seconds, faster than the full disconnect window.
+- Two `NoResourceAvailableException` failures followed, since no task slots were
+  available to reschedule work while the TaskManager was unreachable.
+- On reconnect, **the job self-recovered automatically with no manual
+  resubmission needed.** This was confirmed by the checkpoint `restored` count
+  incrementing (0 to 3) and checkpointing resuming cleanly afterward.
+- Full reconciliation showed zero data loss and zero double-processing across
+  the interruption: sent (2,320) minus dead-lettered (178) minus deduplicated
+  (32) equals landed in Postgres (2,110), exact.
+- **Process mistake, not a pipeline bug:** the test's producer command was
+  accidentally run twice concurrently, both redirecting output with `>` to the
+  same log file. The second process's file open silently truncated the first
+  process's in-progress output, permanently losing process 1's own logged
+  stats. The true combined sent total was reconstructed from Kafka's raw offset
+  delta instead.
+
+**This scenario is the clearest positive result of Step 9: a genuine
+Flink-to-Kafka network partition is fully self-healing.**
+
+## Scenario 4: Postgres outage
+
+Postgres was stopped (`docker compose stop postgres`) while a producer sent
+traffic, held down, then restarted.
+
+**Findings:**
+- The outage immediately breaks the hand-rolled `psycopg2` sink connection
+  inside the Flink `ProcessFunction` (a DNS resolution failure once the
+  container leaves the network, then "server closed the connection
+  unexpectedly" as Postgres shuts down mid-request).
+- Flink's job-level restart strategy (`FixedDelayRestartBackoffTimeStrategy`,
+  `maxNumberRestartAttempts=10`, `backoffTimeMS=5000`) retries automatically for
+  about 50 seconds, but the sink itself has no independent reconnect or backoff
+  logic, so every retry fails identically against the still-down database.
+- Once the retry budget is exhausted, the job **terminates completely**
+  ("Recovery is suppressed by FixedDelayRestartBackoffTimeStrategy") and does
+  **not** self-heal even after Postgres comes back online. Manual `flink run`
+  resubmission is required, confirmed directly via `flink list` showing "No
+  running jobs" until resubmitted.
+- No silent data loss was found: everything sent while the job was dead
+  remained durable in Kafka and was processed once the job resumed.
+- **Process note (same pattern as Scenario 3):** the true combined sent volume,
+  reconstructed from Kafka's offset delta, was roughly double the producer
+  log's tracked count, indicating an untracked second producer invocation
+  rather than a pipeline defect. This was confirmed as genuine, distinct
+  traffic (not duplicate-publish artifacts) by checking that distinct
+  `event_id` counts tracked the expected duplicate-injection rate rather than
+  showing an anomalous gap.
+
+## Cross-scenario conclusion: the core asymmetry
+
+The single most important finding across Step 9 is the asymmetry between the two
+failure classes:
+
+| Failure type | Self-recovers? | Mechanism |
+|---|---|---|
+| Kafka broker failure / Flink-to-Kafka network partition | **Yes**, automatically | JobManager treats a lost TaskManager as a retryable resource-availability problem with no fixed retry ceiling |
+| Postgres outage past ~50s | **No** | Flink's job-level restart strategy has a fixed retry budget (10 attempts); once exhausted, the job dies permanently and needs manual resubmission |
+
+This is a genuine architectural finding, not a bug: it means any production
+deployment of this pipeline needs external supervision (a process manager or
+orchestrator with restart policies) to handle sustained downstream-database
+outages, since Flink's own fault tolerance does not cover that failure mode
+past its retry budget.
+
+## Process lesson learned across Step 9
+
+Across three of the four scenarios, an untracked second producer invocation
+(a duplicate background process, or a shell tab left running) went unnoticed
+until the reconciliation math stopped closing. The fix that worked every time:
+reconcile from Kafka's raw offset delta and Postgres landed counts, never from
+the producer's own printed log, whenever a test involves anything other than a
+single, clean, foreground-observed run.

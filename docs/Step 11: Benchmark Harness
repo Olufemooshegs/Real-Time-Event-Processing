@@ -1,0 +1,29 @@
+# Step 11: Benchmark Harness
+
+A five-level load benchmark was run against the full pipeline, from 1,000 to
+100,000 requested events per second, to characterize throughput behavior and
+find where the system's real limits sit.
+
+## Levels tested
+
+Five levels spanning 1k to 100k requested events/sec, each run to a defined
+duration with checkpoint and latency data captured throughout.
+
+## Findings
+
+- **At lower requested rates, the producer itself is the binding constraint**,
+  not Kafka, Flink, or Postgres. The pipeline downstream of the producer had
+  headroom that the producer's own throughput could not fill.
+- **A sharp, qualitative break emerges at higher requested rates.** Past a
+  certain point, the system stops behaving like a scaled-up version of the
+  lower-rate runs: no checkpoints are captured during the run, latency spikes
+  rather than degrading gracefully, and the system never reaches a steady
+  state before the run ends. This is a genuine capacity cliff, not a gradual
+  slowdown.
+
+## Open item
+
+A documentation caveat around `landed_event_ids` in the benchmark summary
+output was noted as truncated during this step and is worth revisiting for
+completeness before treating the benchmark's landed-count figures as fully
+authoritative at the highest tested levels.

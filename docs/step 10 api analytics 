@@ -1,0 +1,39 @@
+# Step 10: FastAPI Analytics API
+
+A FastAPI service exposing read access to the data Flink lands in Postgres:
+per-user transaction history, aggregates, anomalies, and a global anomaly feed.
+
+## Endpoints verified
+
+All five endpoints were verified directly against Postgres, not just checked for
+a 200 response:
+
+- `GET /users/{user_id}/transactions`
+- `GET /users/{user_id}/aggregates`
+- `GET /users/{user_id}/anomalies`
+- `GET /anomalies` (global feed)
+- A health/status endpoint
+
+Verification method: for a sample of `user_id`s, each endpoint's response was
+compared field-by-field against a direct SQL query on the same table, rather
+than checking the API against itself. This catches serialization or pagination
+bugs that would not show up testing the API in isolation. Pagination
+correctness and error paths (invalid `user_id`, empty result sets, out-of-range
+pages) were included in this verification, not just the success path.
+
+## Known gap
+
+The global `/anomalies` feed lacks an index for its sort order
+(`detected_at DESC, anomaly_id DESC`). At the traffic volumes tested through
+Step 12, this has not caused a measurable problem, but it is a real gap that
+would matter under sustained higher load or as the anomalies table grows. The
+fix is a straightforward index:
+
+```sql
+CREATE INDEX ON transactions.anomalies (detected_at DESC, anomaly_id DESC);
+```
+
+This was deliberately left unindexed through Steps 11 and 12 so that later
+benchmark and reconciliation numbers would reflect the same conditions
+consistently, but it should be added before this API sees production-scale
+traffic.

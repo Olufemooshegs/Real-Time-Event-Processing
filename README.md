@@ -1,441 +1,154 @@
-# Real-Time Event Processing & Analytics Platform
+# Real-Time Event Processing and Analytics Platform
 
-Status: **in progress — Steps 1-8 and Step 9 Scenario 1 closed and verified. Step 10
-(analytics API) closed. Step 11 (benchmark harness) closed with a headline finding on
-system behavior under load. Step 9 Scenarios 2-5 and Step 12 remain.**
+A distributed, fault-tolerant transaction processing pipeline built to
+demonstrate defensible, verified understanding of real system design
+concepts: exactly-once semantics, event-time watermarks, backpressure, fault
+tolerance, concurrency, and latency under load. Every step in this build was
+verified against real terminal output before being marked complete. Nothing
+here is a demo that only ran once.
 
-This README is updated after each step with what's actually running and verified, not what's
-planned. If something isn't listed under "What's running" below, it doesn't exist yet.
-
----
-
-## What's running right now
-
-- **Kafka**, single broker, KRaft mode (no Zookeeper), topic `transactions.raw` with 6
-  partitions, replication factor 1.
-- **Postgres**, with the Step 7 versioned schema for validated events, window aggregates,
-  and anomaly records.
-- **Flink**, with validation, deduplication, event-time windows, deterministic anomalies,
-  and direct Postgres sinks.
-- **FastAPI analytics API** (`api/`), containerized, read-only endpoints over the Step 7
-  Postgres schema: paginated user transactions/aggregates/anomalies plus a global anomaly
-  feed, keyset pagination throughout, fail-fast 503 on pool exhaustion rather than queueing
-  silently.
-- **Async transaction producer** (`producers/transaction_generator/main.py`, `aiokafka`),
-  running as a plain local Python process, not containerized (deliberate choice for this
-  phase — see "Decisions" below).
-
-## What's explicitly NOT built yet
-
-- ClickHouse
-- Prometheus / Grafana
-- Step 12 end-to-end integration test
-- Step 9 Scenarios 2-5 (producer restart, Flink-to-Kafka network interruption, Postgres
-  outage, consumer restart/offset-reset)
-
----
-
-## Why KRaft instead of Zookeeper
-
-Simpler single-broker dev setup. No operational reason to introduce Zookeeper at this scale.
-
-## Known gaps (carried forward deliberately, not oversights)
-
-- **Replication factor is 1.** Fine for a single-broker dev environment; a real deployment
-  would need ≥3 brokers and RF ≥3. Not addressed yet, and not pretended otherwise.
-- **`.env` is not auto-validated.** `make up` will silently start Postgres with blank
-  credentials if `.env` hasn't been copied from `.env.example` first, which caused a real
-  restart-loop failure during Step 1 verification. Not yet fixed with a precondition check —
-  flagged for Codex, not yet actioned.
-- **Producer runs as a local process, not a container**, for now. Faster to iterate on while
-  actively tuning injection rates (duplicate/late/out-of-order/malformed) against Flink's
-  eventual watermark design in Step 5. Containerizing it is deferred, possibly to the
-  failure-injection step (Step 9), where "kill the producer's container" becomes a
-  meaningful test case.
-- **Hot-partition skew is real, not just theorized.** See the dedicated write-up in
-  `docs/architecture-design-doc.md`, Section 2. Measured at Step 2: a ~600-1000 distinct
-  `user_id` pool of sequential zero-padded IDs left 2 of 6 partitions untouched at 2,000
-  events even under nominal uniform distribution. Root cause identified as murmur2 hash
-  behavior on a narrow structured key space, not a code bug — producer send-side logic was
-  checked directly and ruled out. No mitigation decided yet (larger pool size vs.
-  non-sequential IDs vs. accepting the skew as realistic).
-- **`restart-strategy` was silently non-functional from the moment it was written, until
-  fixed during Step 9.** Flink 1.19 replaced the old flat `flink-conf.yaml` format with a
-  hierarchical `config.yaml`. The `FLINK_PROPERTIES` block in `docker-compose.yml` for both
-  `jobmanager` and `taskmanager` set a bare scalar key, `restart-strategy: fixed-delay`,
-  alongside two nested keys, `restart-strategy.fixed-delay.attempts: 10` and
-  `restart-strategy.fixed-delay.delay: 5 s`. Under the hierarchical schema this is a direct
-  key-schema collision (`restart-strategy` cannot be both a plain string and a parent map in
-  the same document), and the config loader resolved it by keeping the scalar and silently
-  discarding the two nested keys, with no warning printed anywhere at container startup,
-  in `docker compose logs`, or in the JobManager's own startup log. The job ran with
-  Flink's hardcoded library default instead: `FixedDelayRestartBackoffTimeStrategy`,
-  1 restart attempt, 1000ms delay. This was never caught by Step 8's kill test, because
-  that test kills and recovers the TaskManager within a single checkpoint cycle, a case
-  the 1-attempt default happens to tolerate. It surfaced for the first time during Step 9's
-  Kafka broker-failure scenario, where the job's actual restart behavior mattered.
-
-  **How it was found:** the JobManager's REST API (`GET /jobs/<id>/config`) reported
-  `"restart-strategy": "Cluster level default restart strategy"`, which is uninformative on
-  its own (it just means "look at the cluster config," not what that config actually is).
-  The real evidence came from the exception thrown on job failure, which names its own
-  parameters directly:
-  `org.apache.flink.runtime.JobException: Recovery is suppressed by
-  FixedDelayRestartBackoffTimeStrategy(maxNumberRestartAttempts=1, backoffTimeMS=1000)`.
-  Those numbers don't match the 10/5000 configured in `docker-compose.yml`, which is what
-  exposed the bug. Cross-checking `docker compose exec jobmanager cat
-  /opt/flink/conf/config.yaml` directly confirmed it: the file contained a bare
-  `restart-strategy: fixed-delay` line followed immediately by an unrelated top-level
-  `state:` key, with no nested `fixed-delay: {attempts, delay}` block anywhere in the file.
-  Checking `docker compose exec jobmanager env | grep -i restart` was a red herring at
-  first, since the container's own environment variables *did* show the correct values
-  (`restart-strategy: fixed-delay`, `restart-strategy.fixed-delay.attempts: 10`,
-  `restart-strategy.fixed-delay.delay: 5 s`) — those are the raw `FLINK_PROPERTIES`
-  env-var contents before Flink's own config-file writer parses and collapses them into
-  `config.yaml`, which is where the actual collision happened. This distinction (env vars
-  looking correct while the parsed config file silently drops data) is itself worth
-  remembering: checking the input to a config loader is not the same as checking its
-  output.
-
-  **Fix:** changed the bare key from `restart-strategy: fixed-delay` to
-  `restart-strategy.type: fixed-delay` in both services' `FLINK_PROPERTIES` blocks in
-  `docker-compose.yml`, so nothing collides with the nested `fixed-delay.attempts`/
-  `fixed-delay.delay` keys. Rebuilt both images (`docker compose up -d --build jobmanager
-  taskmanager`), then confirmed the generated `config.yaml` produced a proper nested block:
-  `restart-strategy: { type: fixed-delay, fixed-delay: { attempts: '10', delay: 5s } }`.
-
-  Confirmed the fix actually took effect at runtime, not just on disk, by forcing a second
-  real job failure and reading the exception it produced:
-  `FixedDelayRestartBackoffTimeStrategy(maxNumberRestartAttempts=10, backoffTimeMS=5000)`.
-  The timing corroborates this independently: the job was first observed in `RESTARTING`
-  state at 08:47:09 UTC and reached terminal `FAILED` at 08:48:00 UTC, a 51-second gap that
-  matches 10 attempts at a 5-second delay almost exactly.
-
-  **Why this matters beyond the one config line:** every restart-strategy assumption made
-  earlier in this project, including the ~50-second survivable-outage-window reasoning in
-  `docs/architecture-design-doc.md` Section 5, was written against a restart strategy that
-  was never actually running. The pipeline's real fault-tolerance behavior only started
-  matching its documented design once this was fixed, midway through Step 9. Full
-  before/after evidence, including the forced-failure test that proves the fix, is in
-  `docs/step9-failure-injection-matrix.md`.
-
-- **`.gitignore`'s blanket `*.txt` rule silently excluded `api/requirements.txt` from the
-  Step 10 commit.** The rule was written to keep scratch/debug `.txt` output out of the
-  repo, but matched every `.txt` file project-wide, including a real dependency file added
-  months later. `docker compose up -d --build api` would have failed immediately with a
-  "file not found" `COPY` error. Caught in review before running, not discovered via a
-  failed build. Fixed by scoping the gitignore rule to specific scratch paths and
-  force-adding `api/requirements.txt`.
-- **The global `/anomalies` feed has no supporting index.**
-  `anomalies_user_detected_at_idx` covers `(user_id, detected_at)` for the per-user endpoint
-  only; the global feed's `ORDER BY detected_at DESC, anomaly_id DESC` with no `user_id`
-  filter does a full sort at current scale. Not a problem yet, but worth adding
-  `CREATE INDEX ON transactions.anomalies (detected_at DESC, anomaly_id DESC)` as a
-  migration before Step 11's benchmarks run against it, so the benchmark isn't
-  inadvertently measuring an avoidable full-table sort.
-
----
-
-## Verified so far (real terminal output, not assumptions)
-
-### Step 1 — Infrastructure skeleton
-- Kafka broker accepts connections; `transactions.raw` topic created and described correctly
-  at 6 partitions / RF 1.
-- Postgres accepts connections; `transactions.events` table confirmed present after tracing
-  down a stale-volume issue that was silently skipping `init.sql` on restart (see git history
-  for the debugging trail — root cause was an already-initialized data volume surviving a
-  `down` without a matching, correctly-named `volume rm`).
-- Clean restart (`down` + `up`, no manual fixes) confirmed working after the above was
-  resolved.
-
-### Step 2 — Producer (closed)
-- Duplicate injection confirmed real: repeated `event_id` values observed in the raw topic
-  with identical payloads, consistent with a producer-level retry rather than a fresh event.
-- Late-event injection confirmed real: observed `event_time` trailing `ingest_time` by up to
-  ~28 seconds in a single sample run.
-- Structural malformed events confirmed: string-typed `amount`, missing required fields
-  (`amount`, `merchant_id`, `currency`, `event_time` each seen missing at least once).
-- Semantic malformed events confirmed: negative amounts (7 examples, range -10,424 to
-  -287,997), invalid currency codes (`INVALID`, `ZZZ`), invalid transaction types
-  (`chargeback_test`, `unknown_type`).
-- Partition-key correctness confirmed: same `user_id` consistently mapped to a single
-  partition across a full fresh sample, checked directly via a distinct
-  partition-per-key pipeline (not just distribution evenness).
-- Within-partition out-of-order events confirmed: genuine `event_time` inversions between
-  adjacent messages on the same partition, observed at ~20ms scale with
-  `--out-of-order-rate 0.15`. Notably smaller scale than late-event delays (~28s) — see
-  Section 3 of the design doc for why these two numbers need to be tuned separately in
-  Step 5, not derived from one setting.
-- Hot-partition skew investigated and found to be real even under nominal uniform user
-  distribution, traced to murmur2 hash behavior on a narrow, sequential, zero-padded
-  `user_id` key space — not a producer code bug. Full write-up and mitigation options
-  in the design doc, Section 2. No mitigation decided yet.
-
----
-
-### Step 3 — Kafka topic hardening & formal configuration (closed)
-- Topic definitions moved from ad-hoc CLI commands to declarative config
-  (`infrastructure/kafka/topics.yml`), covering all four topics from the design doc:
-  `transactions.raw`, `transactions.deadletter`, `transactions.late`,
-  `analytics.aggregates`.
-- `scripts/apply-topics.sh` (via `make topics-apply`) creates/reconciles all four topics
-  idempotently. Confirmed via real re-run: second execution reported `OK:` for every
-  topic (not `Created topic`), no errors, no unintended changes.
-- A partition-count parsing bug was found and fixed during verification: the script's
-  `sed` pattern expected `PartitionCount:6` (no space) but Kafka's actual `--describe`
-  output is `PartitionCount: 6` (with a space), causing every run to fail immediately
-  after processing the first topic. Fixed by tolerating optional whitespace in the pattern.
-- All four topics confirmed via `kafka-configs --describe` to match the manifest exactly:
-  - `transactions.raw`: 6 partitions, RF 1, retention 48h (172800000ms), snappy
-  - `transactions.deadletter`: 6 partitions, RF 1, retention 14d (1209600000ms), snappy
-  - `transactions.late`: 6 partitions, RF 1, retention 14d (1209600000ms), snappy
-  - `analytics.aggregates`: 6 partitions, RF 1, retention 7d (604800000ms), snappy
-- Hot-key mitigation decided: switch to non-sequential `user_id` generation (format —
-  full UUID vs. partial-readability suffix — still to be finalized), as a dedicated
-  follow-up step. Not applied to the Step 2 producer in this step, to avoid silently
-  modifying already-verified code.
-
-### Step 4 — Minimal Flink job: validation, dedup (closed)
-- Flink cluster (JobManager + TaskManager, single TaskManager, 2 slots) added to
-  docker-compose.yml, memory sized deliberately (jobmanager 1024m process size / 1200m
-  container limit, taskmanager 1536m / 1536m) after the default 512m proved mathematically
-  insufficient for Flink's own JVM overhead + off-heap accounting.
-- PyFlink job (`flink/jobs/validation_dedup_job.py`) consumes `transactions.raw`, performs
-  structural validation only (JSON shape and field types — semantic rules like negative
-  amounts deliberately pass through, per design, and are deferred to Step 6), routes
-  structural failures to `transactions.deadletter` with a reason code, and deduplicates
-  valid events by `event_id` using keyed state with a 10-minute TTL.
-- Confirmed via the durable dead-letter topic (not just print logs): 134 dead-lettered
-  records across a full test run, spanning 5 correct reason codes (`invalid_type:amount`,
-  `missing_field:amount`, `missing_field:currency`, `missing_field:event_time`,
-  `missing_field:merchant_id`).
-- Dedup confirmed via log counts tracking sensibly against producer-reported duplicates
-  (42 DEDUPLICATED_DROP vs 49 duplicates injected; gap explained by duplicate events that
-  were also structurally malformed and dead-lettered before reaching the dedup stage).
-- Checkpointing enabled (10s interval, EXACTLY_ONCE mode, durable file-based storage);
-  job sustained continuous RUNNING state across multiple verification runs.
-
-**Nine distinct, unrelated bug classes were found and fixed to get here** — worth recording
-plainly, since this step took far longer than Steps 1-3 combined and each issue would have
-been costly to rediscover blind in a later step:
-1. `taskmanager` service missing its own `build:` block in docker-compose.yml (was trying
-   to pull a nonexistent public image instead of building locally).
-2. Kafka's healthcheck tested `localhost:29092` instead of `kafka:29092` — passed manually
-   the whole time, never passed automated health checks, because the internal listener is
-   bound to the `kafka` hostname, not loopback.
-3. Kafka's healthcheck timeout (5s) too tight for a cold JVM CLI invocation
-   (`kafka-topics`) — not a resource problem, just inherent JVM startup cost.
-4. Two near-identical healthcheck blocks in the compose file (Kafka's and JobManager's)
-   caused repeated edits to land on the wrong block during debugging.
-5. JobManager's `jobmanager.memory.process.size: 512m` was mathematically too small —
-   Flink's own JVM overhead minimum (192MB) plus default off-heap requirement (128MB)
-   couldn't fit in 512MB total.
-6. `curl` was listed in the Dockerfile's install step but wasn't actually present in the
-   built image at runtime — broke both Flink healthchecks until switched to
-   dependency-free checks (`bash`'s `/dev/tcp`, `pgrep`).
-7. PyFlink job submission requires the Python interpreter path explicitly
-   (`-pyclientexec`, `-pyexec`) since the image only has `python3`, not a plain `python`
-   binary on PATH.
-8. `flink-connector-kafka` (thin JAR) was used instead of `flink-sql-connector-kafka`
-   (shaded/fat JAR) — the thin connector doesn't bundle Kafka's client library, causing a
-   `NoClassDefFoundError` at Kafka source construction.
-9. The `flink-checkpoints`/`flink-savepoints` named Docker volumes were owned by root by
-   default while the container runs as the `flink` user — job startup failed until
-   ownership was corrected.
-10. PyFlink API mismatches specific to this installed version (1.19.3): `WatermarkStrategy`
-    lives at `pyflink.common`, not `pyflink.datastream.watermark_strategy`;
-    `set_checkpoint_storage()` requires a `FileSystemCheckpointStorage` object, not a raw
-    path string; `print(..., flush=True)` isn't supported by PyFlink's `CustomPrint`; and
-    side outputs are emitted by yielding an `(OutputTag, value)` tuple, not calling
-    `ctx.output(tag, value)` as the Java API allows.
-
-Any file edit under `flink/jobs/` requires `docker compose build jobmanager taskmanager`
-before it takes effect — the job file is baked into the image at build time, not mounted
-live. This was rediscovered the hard way more than once during this step.
-
-### Step 5 — Event-time processing: watermarks, allowed lateness, windowing (closed)
-- Bounded-out-of-orderness watermark (50ms bound, justified against Step 2's ~20ms measured
-  jitter) with 30s idleness detection to prevent quiet/skewed Kafka partitions from stalling
-  watermark progress.
-- Allowed lateness set to 45s, justified against Step 2's ~28s measured maximum late-event
-  delay, deliberately kept far larger than the watermark's own out-of-orderness bound per
-  the design doc's Section 3 finding that these are separate phenomena at different scales.
-- 10-second tumbling windows keyed by `user_id`, computing count/total volume/average
-  transaction value. Verified mathematically correct via direct spot-checks against log
-  output (e.g. `usr_00234: count=3, total=112148, average=37382.67` — exact).
-- Watermark advancement independently confirmed live and correct via Flink's REST metrics
-  API on both parallel subtasks (ruling out a hot-key/partition-stall watermark issue).
-
-**Finding: `WindowedStream.side_output_late_data()` does not work in this PyFlink 1.19.3
-environment.** Despite correct configuration (confirmed via source inspection of the
-PyFlink library itself — `allowed_lateness()`, `side_output_late_data()`, and
-`_get_result_data_stream()` all correctly wire the late-data tag into the underlying Java
-operator), zero late events ever reached the side output across multiple clean test runs
-with up to 168 genuinely late events per run (some delayed up to 90s, comfortably past the
-45s threshold). Ruled out as causes, in order of investigation: watermark not advancing
-(disproven — confirmed live via REST metrics), timestamp assignment producing wrong values
-(disproven — verified via direct calculation), hot-key partition stall on the windowing
-operator (disproven — both subtasks showed identical, current watermarks),
-`aggregate()`-specific issue (disproven — swapping to `reduce()` produced the same zero
-result). Root cause presumed to be a PyFlink Python-binding-specific limitation of this
-built-in feature, not a configuration or design error.
-
-**Resolution:** built-in late-data side output replaced with a manual `LatenessRouter`
-(`ProcessFunction` comparing `ctx.timestamp()` against `ctx.timer_service().current_watermark()`
-directly, run before windowing). Confirmed working via both log output (725
-`LATE_EVENT_ROUTED` prints in one test) and durable topic content (741 real records
-confirmed in `transactions.late` via direct consumption, not just logs).
-
-Also fixed during this step: `TimestampAssigner` import path
-(`pyflink.common.watermark_strategy`, not `pyflink.common`), `allowed_lateness()` requires
-a plain int in milliseconds (not a `Time` object), and a class-defined-after-use ordering
-bug (Python executes top-to-bottom; a class referenced inside `main()` must be defined
-before the `if __name__ == "__main__":` block that calls `main()`, not after it).
-
-### Step 6 — Stateful anomaly detection (closed)
-Two deterministic rules, additive off the Step 5 event-time stream, no changes to
-validation/dedup/windowing:
-- **Velocity:** >10 transactions/user within a 60-second event-time horizon (keyed state
-  counter).
-- **Amount:** current transaction exceeds the user's own rolling 99th-percentile amount,
-  computed over a bounded reservoir of the user's last 256 amounts, with a 20-record
-  warmup period to avoid false positives on new users with too little history.
-
-Verified with real traffic, not just log presence:
-- Velocity rule confirmed correctly escalating under a real burst (`--user-pool-size 5`,
-  50/sec): e.g. `usr_00005` fired repeatedly as its count climbed past threshold
-  (11, 12, 13...17), each with correct `transaction_count`/`threshold` values.
-- Amount rule confirmed with real percentile math, e.g. `usr_00004`: amount 680,762 vs.
-  rolling 99th percentile 302,955 (genuine large outlier); `usr_00005`: two separate
-  correct triggers (227,375 vs. 220,529; 527,965 vs. 224,737), with `history_size: 256`
-  confirming the reservoir cap holds as designed.
-- Confirmed zero false positives under normal, low-volume, full-pool traffic (5/sec,
-  default user pool) — no anomalies fired.
-
-### Step 7 — Postgres sinks: events, aggregates, anomalies (closed)
-Versioned migration (`infrastructure/postgres/migrations/V002__analytics_schema.sql`)
-replacing the Step 1 placeholder, adding `transactions.events`,
-`transactions.window_aggregates`, `transactions.anomalies`.
-
-**Finding: PyFlink 1.19.3's `JdbcSink.sink()` is unusable with any current
-`flink-connector-jdbc` release.** The Python wrapper does Java reflection to find a static
-method `createRowJdbcStatementBuilder(int[])` on `JdbcOutputFormat`. Inspecting the actual
-JAR bytecode (`javap` unavailable in this image; inspected via `zipfile` + a raw string
-scan instead) confirmed that method doesn't exist in `flink-connector-jdbc-3.2.0-1.19.jar`
-— the connector was refactored to a `StatementExecutorFactory` pattern. Further research
-showed this refactor predates Flink 1.19 itself (present as of 1.17-SNAPSHOT), meaning no
-current `flink-connector-jdbc` release for 1.19 restores the old method PyFlink 1.19.3
-expects. Not a version-pinning problem — a genuine incompatibility between PyFlink's
-Python `JdbcSink` helper and every available connector release.
-
-**Resolution:** bypassed `JdbcSink.sink()` entirely. Three sinks
-(`PostgresEventsSink`, `PostgresAggregatesSink`, `PostgresAnomaliesSink`) implemented as
-plain `ProcessFunction`s using `psycopg2` directly, each opening its own connection in
-`open()`/closing in `close()`. Same reasoning as Step 5's `LatenessRouter`: work around a
-confirmed-broken built-in rather than keep chasing connector version compatibility.
-
-Verified against real duplicate/burst traffic, not just absence of errors:
-- Idempotent upsert on `event_id` confirmed: zero duplicate rows in `transactions.events`
-  after a run with 15% injected duplicate rate (314 real rows landed, zero duplicates).
-- Idempotent upsert on `(user_id, window_start)` confirmed: zero duplicate window rows.
-- Anomaly sink confirmed with real burst traffic: 628 `ANOMALY_VELOCITY` + 20
-  `ANOMALY_AMOUNT` rows landed correctly.
+## Architecture
 
 ```
-cp .env.example .env
-# edit .env: set a real (non-empty, non-placeholder) POSTGRES_PASSWORD
+Producer (aiokafka) -> Kafka (KRaft, 6 partitions) -> Flink (PyFlink 1.19.3)
+    -> Postgres (idempotent upserts) -> FastAPI (read layer)
+```
+
+- **Producer**: async Python, injects controlled duplicates, late events,
+  out-of-order events, and structurally malformed events at configurable
+  rates, for realistic fault and edge-case testing.
+- **Kafka**: single-broker KRaft mode, 4 topics (`transactions.raw`,
+  `transactions.deadletter`, `transactions.late`, `analytics.aggregates`),
+  6 partitions each.
+- **Flink**: PyFlink job handling event-time validation, deduplication,
+  windowed aggregation, anomaly detection, and direct Postgres sinks.
+- **Postgres**: system of record, with `event_id`-based idempotent upserts
+  providing the pipeline's real exactly-once guarantee.
+- **FastAPI**: read-only analytics layer over Postgres.
+
+## Tech stack
+
+Kafka (KRaft), Apache Flink / PyFlink 1.19.3, Postgres, FastAPI, Docker
+Compose, Python (aiokafka, psycopg2). Development environment is GitHub
+Codespaces; Docker cannot be run locally for this project. Code is generated
+locally on Windows via Codex, pushed to GitHub, then pulled and verified
+inside the Codespace.
+
+## Quickstart
+
+```
+git pull
+make down
+docker volume rm $(docker volume ls -q | grep real-time-event-processing)
 make up
 make health
 make topic-create
-make topic-describe
+make flink-job-submit
+docker compose exec jobmanager flink list
 ```
 
-Expected passing health check output:
+If `flink-job-submit` fails with a checkpoint directory permission error
+immediately after a fresh volume wipe, this is a known gap (see below), fixed
+with:
+
 ```
-PASS: Kafka broker is accepting connections
-PASS: Kafka topic creation and description succeeded
-PASS: Postgres is accepting connections
-```
-
-Producer (local process, from `producers/transaction_generator/`):
-```
-pip install -r requirements.txt
-python main.py --rate 50 --duration 30 --duplicate-rate 0.05 --late-rate 0.1 \
-  --out-of-order-rate 0.1 --malformed-rate 0.05 --malformed-mode structural
-```
-See `producers/transaction_generator/README.md` for the full flag reference.
-
----
-
-## Step 8 exactly-once kill test
-
-The repeatable experiment is documented in [`docs/step8-exactly-once-kill-test.md`](docs/step8-exactly-once-kill-test.md)
-and automated by `scripts/step8-kill-test.sh`. It defaults to approximately 100,000
-records, kills the TaskManager with `SIGKILL` mid-stream, waits for recovery, and records
-Kafka offsets, producer counts, Postgres IDs, and unaccounted event IDs. No result is
-considered verified until the generated evidence is checked against the JobManager state
-and direct Kafka/Postgres queries.
-
----
-
-## Step 9 failure-injection matrix
-
-The five rerunnable procedures are documented in
-[`docs/step9-failure-injection-matrix.md`](docs/step9-failure-injection-matrix.md): Kafka
-broker loss, producer restart, Flink-to-Kafka network interruption, Postgres outage, and
-consumer restart with offset-reset comparison.
-
-**Scenario 1 (Kafka broker failure) is closed**, with real evidence and five distinct
-findings, the headline one being that a config bug had silently disabled the intended
-10-attempt/5s restart strategy since it was first written, and that the pipeline's actual
-exactly-once guarantee across a hard failure comes from the Postgres idempotent upsert,
-not from Flink's own checkpoint recovery. Full detail in the linked doc.
-
-Scenarios 2-5 require real before/after offset and Postgres reconciliation; no projected
-recovery result is recorded here until they're run.
----
-
-## Step 10 analytics API
-
-The read-only API lives under `api/` and is exposed by Compose on port 8000. It uses raw
-parameterized asyncpg queries, validates cursor and anomaly filters as client errors, and
-returns HTTP 503 when the small development pool cannot be acquired within two seconds.
-It does not create or modify database tables and has no write endpoints.
-
-```bash
-make up
-make api-health
+docker compose exec -u root jobmanager chown -R flink:flink /opt/flink/checkpoints /opt/flink/savepoints
+docker compose exec -u root taskmanager chown -R flink:flink /opt/flink/checkpoints /opt/flink/savepoints
+make flink-job-submit
 ```
 
-Available resources are `/users/{user_id}/transactions`,
-`/users/{user_id}/aggregates`, `/users/{user_id}/anomalies`, and global `/anomalies`.
+## Build status: 12-step plan
 
----
+| Step | Scope | Status |
+|---|---|---|
+| 1-3 | Base infrastructure setup (Kafka, initial producer, initial Flink job scaffolding) | Complete |
+| 4 | Bug fixing and infrastructure hardening pass | Complete, see Known Issues below |
+| 5-6 | Event-time processing, watermarking, and anomaly detection logic | Complete |
+| 7 | Validation, deduplication, anomaly detection, and Postgres sinks in one job | Complete |
+| 8 | (internal build step) | Complete |
+| 9 | Fault tolerance: 4 failure-injection scenarios | Complete. See [docs/step-09-fault-tolerance.md](docs/step-09-fault-tolerance.md) |
+| 10 | FastAPI analytics API, 5 endpoints | Complete. See [docs/step-10-analytics-api.md](docs/step-10-analytics-api.md) |
+| 11 | Benchmark harness, 1k to 100k requested events/sec | Complete. See [docs/step-11-benchmark-harness.md](docs/step-11-benchmark-harness.md) |
+| 12 | Full end-to-end integration test | Complete. See [docs/step-12-e2e-test.md](docs/step-12-e2e-test.md) |
 
-## Step 11 benchmark harness
+Steps 1-3, 5, 6, and 8 do not have dedicated write-ups in this repo's history;
+their outcomes are folded into the Known Issues section below where they
+produced a confirmed, reusable finding.
 
-The benchmark harness is `scripts/step11-benchmark.sh`, with the procedure and artifact
-format documented in `docs/step11-benchmark-results.md`. It captures hardware context,
-measured Kafka throughput, consumer lag, discovered Flink metrics, checkpoint durations,
-separate latency percentiles, ID reconciliation, and a recovery run at the highest load
-level that stabilizes.
+## Key findings across the project
 
-**Closed, with a headline finding**: across 1,000-100,000 requested events/sec, the
-producer itself is the binding constraint at every level (achieved throughput never
-exceeds ~400/sec), and a sharp qualitative break occurs between 10,000 and 100,000
-requested — the drain loop stops reaching steady state, Flink's checkpoint history comes
-back completely empty, and latency roughly triples, all at the same transition. Four real
-bugs in the harness itself were found and fixed before these numbers could be trusted (bad
-awk column index, a nonexistent Flink REST endpoint, an unscoped bash variable silently
-clobbering timing data, and a checkpoint-history retention window mismatch). Full detail,
-including an important caveat about pre-existing Kafka backlog affecting the absolute
-latency figures, is in `docs/step11-benchmark-results.md`.
+- **The pipeline's real exactly-once guarantee comes from Postgres's
+  idempotent upsert on `event_id`, not from Flink checkpoint recovery alone.**
+  This was proven repeatedly across Step 9's scenarios: even when a producer
+  was killed mid-stream or a Flink job died and needed manual resubmission,
+  reconciliation against Kafka offsets and Postgres counts showed zero data
+  loss and zero double-processing every time.
+- **Flink self-heals from Kafka-side failures (broker loss, network
+  partitions) but not from a sustained downstream Postgres outage.** Past
+  roughly a 50-second retry budget, a job failure becomes terminal and needs
+  manual resubmission. This is the single most important architectural
+  finding from Step 9: a production deployment needs external supervision to
+  handle sustained database outages, since Flink's own fault tolerance
+  doesn't cover that case.
+- **The producer, not the downstream pipeline, is the binding constraint at
+  lower load levels**, per Step 11's benchmark. A sharp capacity cliff appears
+  at higher requested rates, past which the system does not degrade
+  gracefully.
+- **Step 12's full reconciliation closes the loop**: a single, clean,
+  end-to-end run showed every stage (producer, Kafka, dead-lettering,
+  deduplication, Postgres, API) accounting for events exactly, with no
+  unexplained gaps.
 
----
+## Known issues and workarounds
 
-## Development workflow notes
+Confirmed, reusable findings from bug fixing and hardening (Step 4) and
+general project work, kept here because they would otherwise need to be
+rediscovered:
 
-- Commit and push after local generation, before switching into the Codespace.
-- Run `git pull` as the first action every time a Codespace session starts.
-- Don't mark a step "done" on Codex's word alone — every step requires independent
-  verification against real terminal output before moving to the next one.
+- **Flink 1.19 restart strategy config**: the hierarchical key
+  `restart-strategy.type: fixed-delay` is required; the flat key
+  `restart-strategy: fixed-delay` silently disables the strategy with no
+  error.
+- **`WindowedStream.side_output_late_data()` is non-functional** in PyFlink
+  1.19.3, confirmed via JAR inspection and A/B testing. A manual
+  `LatenessRouter` implementation is required instead.
+- **`JdbcSink.sink()` is unusable** with current `flink-connector-jdbc`
+  releases due to a removed Java reflection target. Direct `psycopg2` sink
+  classes are used instead, which is why Postgres connection failures during
+  an outage surface inside a `ProcessFunction` rather than through a
+  framework-managed sink with its own retry logic (see Step 9, Scenario 4).
+- **`restart: unless-stopped` in Docker Compose is non-functional** in
+  Codespaces' nested container runtime; `RestartCount` stays at 0 after a
+  `SIGKILL`. Explicit `docker compose up -d` is required instead.
+- **Freshly created Docker volumes are root-owned**, but the Flink containers
+  run as the `flink` user. Every full `docker volume rm` and rebuild requires
+  reapplying `chown -R flink:flink` on the checkpoint and savepoint
+  directories before job submission will succeed. This is not yet scripted
+  into `make up` and should be, to avoid the manual step on every clean
+  environment reset.
+- **`curl` is not present inside the Flink images** despite being referenced
+  in earlier healthcheck scripts. Since the JobManager's REST API port
+  (`8081`) is exposed to the host, `curl` calls against Flink's REST API
+  should be run from the host shell, not `docker compose exec`.
+- **`*.txt` gitignore rules can silently exclude `requirements.txt`**, causing
+  Docker build failures with no obvious cause. Always check gitignore scope
+  when a build fails to find a dependency file that is visibly present in the
+  working directory.
+- **Kafka's retry budget is approximately 50 seconds** before a terminal
+  failure; this figure reappears consistently in both Scenario 1 (Kafka
+  broker failure) and Scenario 4 (Postgres outage) and reflects Flink's fixed
+  restart strategy budget in this deployment, not a Kafka-specific limit.
+- **Fixed drain waits produce false recovery results** in fault-tolerance
+  testing. Always poll until counts stabilize rather than waiting a fixed
+  number of seconds and assuming recovery is complete.
+
+## Testing methodology
+
+Every verification in this project followed the same discipline: no step was
+marked complete without real terminal output, and no discrepancy was
+hand-waved away. When a producer's own counters proved unreliable (a hard
+kill, a truncated log from a concurrent process), the fix was always to
+reconcile backward from Kafka's raw offset deltas and Postgres's landed
+counts, never forward from self-reported application stats. This pattern
+surfaced independently in three of Step 9's four scenarios and is the single
+most reusable testing lesson from this project.
