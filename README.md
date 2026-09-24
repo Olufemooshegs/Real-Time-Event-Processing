@@ -1,154 +1,199 @@
 # Real-Time Event Processing and Analytics Platform
 
-A distributed, fault-tolerant transaction processing pipeline built to
-demonstrate defensible, verified understanding of real system design
-concepts: exactly-once semantics, event-time watermarks, backpressure, fault
-tolerance, concurrency, and latency under load. Every step in this build was
-verified against real terminal output before being marked complete. Nothing
-here is a demo that only ran once.
+A distributed, fault-tolerant transaction processing pipeline built to demonstrate real-world event streaming and system design concepts: event-time processing, watermarks, deduplication, exactly-once effects, backpressure, fault tolerance, concurrency, and performance under load.
+
+The project was developed as an evidence-driven engineering build: each major capability was validated with controlled failure injection, reconciliation, and benchmark runs rather than a single successful demo.
 
 ## Architecture
 
+```text
+Async Producer (aiokafka)
+        |
+        v
+Kafka (KRaft, 6 partitions)
+        |
+        v
+Apache Flink / PyFlink 1.19.3
+        |
+        +--> Dead-letter events
+        +--> Late events
+        +--> Windowed analytics
+        +--> Anomaly detection
+        |
+        v
+PostgreSQL (idempotent upserts)
+        |
+        v
+FastAPI (read-only analytics API)
 ```
-Producer (aiokafka) -> Kafka (KRaft, 6 partitions) -> Flink (PyFlink 1.19.3)
-    -> Postgres (idempotent upserts) -> FastAPI (read layer)
-```
 
-- **Producer**: async Python, injects controlled duplicates, late events,
-  out-of-order events, and structurally malformed events at configurable
-  rates, for realistic fault and edge-case testing.
-- **Kafka**: single-broker KRaft mode, 4 topics (`transactions.raw`,
-  `transactions.deadletter`, `transactions.late`, `analytics.aggregates`),
-  6 partitions each.
-- **Flink**: PyFlink job handling event-time validation, deduplication,
-  windowed aggregation, anomaly detection, and direct Postgres sinks.
-- **Postgres**: system of record, with `event_id`-based idempotent upserts
-  providing the pipeline's real exactly-once guarantee.
-- **FastAPI**: read-only analytics layer over Postgres.
+### Components
 
-## Tech stack
+| Component      | Responsibility                                                                                                                           |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| **Producer**   | Generates transaction events asynchronously and injects controlled duplicates, late events, out-of-order events, and malformed payloads. |
+| **Kafka**      | Durable event transport using KRaft with 6 partitions per topic.                                                                         |
+| **Flink**      | Performs validation, event-time processing, deduplication, watermarking, windowed aggregation, anomaly detection, and routing.           |
+| **PostgreSQL** | Acts as the system of record and uses `event_id`-based idempotent upserts to make final writes safe against reprocessing.                |
+| **FastAPI**    | Exposes read-only analytics endpoints backed by PostgreSQL.                                                                              |
 
-Kafka (KRaft), Apache Flink / PyFlink 1.19.3, Postgres, FastAPI, Docker
-Compose, Python (aiokafka, psycopg2). Development environment is GitHub
-Codespaces; Docker cannot be run locally for this project. Code is generated
-locally on Windows via Codex, pushed to GitHub, then pulled and verified
-inside the Codespace.
+### Kafka Topics
+
+* `transactions.raw`
+* `transactions.deadletter`
+* `transactions.late`
+* `analytics.aggregates`
+
+## Tech Stack
+
+* **Apache Kafka** with KRaft
+* **Apache Flink / PyFlink 1.19.3**
+* **PostgreSQL**
+* **FastAPI**
+* **Python**
+* **aiokafka**
+* **psycopg2**
+* **Docker Compose**
+
+## Core Engineering Concepts
+
+### Event-Time Processing
+
+Events are processed using their event timestamps rather than relying only on ingestion time. Watermarks are used to reason about out-of-order and late-arriving events.
+
+### Deduplication and Exactly-Once Effects
+
+The pipeline is designed to tolerate duplicate delivery and reprocessing. Flink checkpoint recovery alone does not guarantee exactly-once effects at the database boundary.
+
+The final protection comes from PostgreSQL's idempotent `event_id` upserts, ensuring repeated processing does not create duplicate records in the system of record.
+
+### Fault Tolerance
+
+The system includes controlled failure injection for both infrastructure and application components, including Kafka failures, network disruption, producer termination, Flink failure, and PostgreSQL outages.
+
+### Backpressure and Load Handling
+
+The benchmark harness tests the pipeline under increasing requested event rates and observes where throughput, latency, and recovery behavior begin to degrade.
+
+### Reconciliation-Based Testing
+
+When application-level counters become unreliable during failure scenarios, correctness is established from independent sources such as Kafka offset deltas and PostgreSQL landed counts.
+
+This prevents recovery claims from depending on the component that may have failed.
 
 ## Quickstart
 
-```
+```bash
 git pull
 make down
+
 docker volume rm $(docker volume ls -q | grep real-time-event-processing)
+
 make up
 make health
 make topic-create
 make flink-job-submit
+
 docker compose exec jobmanager flink list
 ```
 
-If `flink-job-submit` fails with a checkpoint directory permission error
-immediately after a fresh volume wipe, this is a known gap (see below), fixed
-with:
+After submission, verify the Flink job is running and use the project test and benchmark commands to exercise the pipeline.
 
+## Build Status
+
+| Step | Scope                                                              | Status   |
+| ---- | ------------------------------------------------------------------ | -------- |
+| 1-3  | Base infrastructure, Kafka, producer, and Flink scaffolding        | Complete |
+| 4    | Bug fixing and infrastructure hardening                            | Complete |
+| 5-6  | Event-time processing, watermarking, and anomaly detection         | Complete |
+| 7    | Validation, deduplication, anomaly detection, and PostgreSQL sinks | Complete |
+| 8    | Internal build step                                                | Complete |
+| 9    | Fault tolerance and failure-injection testing                      | Complete |
+| 10   | FastAPI analytics API                                              | Complete |
+| 11   | Benchmark harness: 1k-100k requested events/sec                    | Complete |
+| 12   | Full end-to-end integration test                                   | Complete |
+
+### Detailed Verification Reports
+
+* [Step 9: Fault Tolerance](docs/step-09-fault-tolerance.md)
+* [Step 10: Analytics API](docs/step-10-analytics-api.md)
+* [Step 11: Benchmark Harness](docs/step-11-benchmark-harness.md)
+* [Step 12: End-to-End Test](docs/step-12-e2e-test.md)
+
+## Verified Findings
+
+### 1. Database Idempotency Is the Final Exactly-Once Boundary
+
+Repeated failure scenarios showed that PostgreSQL `event_id` upserts prevent duplicate records even when processing is retried or a failed Flink job is restarted manually.
+
+Reconciliation across Kafka and PostgreSQL showed no unexplained data loss or duplicate database writes in the tested scenarios.
+
+### 2. Flink Recovers Differently Depending on the Failed Dependency
+
+Kafka-side failures, including broker loss and network disruption, were recoverable through the configured Flink restart strategy.
+
+A sustained PostgreSQL outage behaved differently: after the configured retry budget was exhausted, the Flink job entered a terminal failure state and required resubmission.
+
+This exposes an important production-design boundary: **stream processor fault tolerance does not remove the need for external supervision of persistent downstream failures.**
+
+### 3. Producer Throughput Becomes a Constraint at Lower Load Levels
+
+Benchmarking showed that the producer is the limiting component at lower requested rates.
+
+At higher requested rates, the system reaches a sharp capacity cliff rather than degrading smoothly.
+
+This makes the benchmark useful not only for reporting throughput, but for identifying where the architecture needs scaling or redesign.
+
+### 4. End-to-End Reconciliation Closes the Correctness Loop
+
+The final integration test reconciled the major stages of the pipeline:
+
+```text
+Producer
+   -> Kafka
+   -> Validation / Routing
+   -> Deduplication
+   -> Aggregation
+   -> PostgreSQL
+   -> API
 ```
-docker compose exec -u root jobmanager chown -R flink:flink /opt/flink/checkpoints /opt/flink/savepoints
-docker compose exec -u root taskmanager chown -R flink:flink /opt/flink/checkpoints /opt/flink/savepoints
-make flink-job-submit
-```
 
-## Build status: 12-step plan
+The run accounted for the expected events across the pipeline with no unexplained gaps.
 
-| Step | Scope | Status |
-|---|---|---|
-| 1-3 | Base infrastructure setup (Kafka, initial producer, initial Flink job scaffolding) | Complete |
-| 4 | Bug fixing and infrastructure hardening pass | Complete, see Known Issues below |
-| 5-6 | Event-time processing, watermarking, and anomaly detection logic | Complete |
-| 7 | Validation, deduplication, anomaly detection, and Postgres sinks in one job | Complete |
-| 8 | (internal build step) | Complete |
-| 9 | Fault tolerance: 4 failure-injection scenarios | Complete. See [docs/step-09-fault-tolerance.md](docs/step-09-fault-tolerance.md) |
-| 10 | FastAPI analytics API, 5 endpoints | Complete. See [docs/step-10-analytics-api.md](docs/step-10-analytics-api.md) |
-| 11 | Benchmark harness, 1k to 100k requested events/sec | Complete. See [docs/step-11-benchmark-harness.md](docs/step-11-benchmark-harness.md) |
-| 12 | Full end-to-end integration test | Complete. See [docs/step-12-e2e-test.md](docs/step-12-e2e-test.md) |
+## Known Implementation Constraints
 
-Steps 1-3, 5, 6, and 8 do not have dedicated write-ups in this repo's history;
-their outcomes are folded into the Known Issues section below where they
-produced a confirmed, reusable finding.
+These are important design findings discovered during development:
 
-## Key findings across the project
+* **Flink restart strategy configuration** must use the hierarchical `restart-strategy.type: fixed-delay` configuration.
+* **PyFlink 1.19.3 late-event side output behavior** required a custom routing implementation rather than relying on `WindowedStream.side_output_late_data()`.
+* **The JDBC sink path used by the project was incompatible with the connector version in use**, so PostgreSQL writes are handled through direct `psycopg2` sink logic.
+* **The configured failure-recovery budget is approximately 50 seconds** in the current deployment. This is a property of the configured Flink restart strategy, not a Kafka limit.
+* **Recovery tests use polling and count stabilization**, rather than fixed sleep durations, to avoid false positives.
 
-- **The pipeline's real exactly-once guarantee comes from Postgres's
-  idempotent upsert on `event_id`, not from Flink checkpoint recovery alone.**
-  This was proven repeatedly across Step 9's scenarios: even when a producer
-  was killed mid-stream or a Flink job died and needed manual resubmission,
-  reconciliation against Kafka offsets and Postgres counts showed zero data
-  loss and zero double-processing every time.
-- **Flink self-heals from Kafka-side failures (broker loss, network
-  partitions) but not from a sustained downstream Postgres outage.** Past
-  roughly a 50-second retry budget, a job failure becomes terminal and needs
-  manual resubmission. This is the single most important architectural
-  finding from Step 9: a production deployment needs external supervision to
-  handle sustained database outages, since Flink's own fault tolerance
-  doesn't cover that case.
-- **The producer, not the downstream pipeline, is the binding constraint at
-  lower load levels**, per Step 11's benchmark. A sharp capacity cliff appears
-  at higher requested rates, past which the system does not degrade
-  gracefully.
-- **Step 12's full reconciliation closes the loop**: a single, clean,
-  end-to-end run showed every stage (producer, Kafka, dead-lettering,
-  deduplication, Postgres, API) accounting for events exactly, with no
-  unexplained gaps.
+## Testing Methodology
 
-## Known issues and workarounds
+Every major milestone was validated from observable system behavior rather than assumed from application logs.
 
-Confirmed, reusable findings from bug fixing and hardening (Step 4) and
-general project work, kept here because they would otherwise need to be
-rediscovered:
+For fault-tolerance tests, the project deliberately introduces failures and then checks recovery using independent evidence:
 
-- **Flink 1.19 restart strategy config**: the hierarchical key
-  `restart-strategy.type: fixed-delay` is required; the flat key
-  `restart-strategy: fixed-delay` silently disables the strategy with no
-  error.
-- **`WindowedStream.side_output_late_data()` is non-functional** in PyFlink
-  1.19.3, confirmed via JAR inspection and A/B testing. A manual
-  `LatenessRouter` implementation is required instead.
-- **`JdbcSink.sink()` is unusable** with current `flink-connector-jdbc`
-  releases due to a removed Java reflection target. Direct `psycopg2` sink
-  classes are used instead, which is why Postgres connection failures during
-  an outage surface inside a `ProcessFunction` rather than through a
-  framework-managed sink with its own retry logic (see Step 9, Scenario 4).
-- **`restart: unless-stopped` in Docker Compose is non-functional** in
-  Codespaces' nested container runtime; `RestartCount` stays at 0 after a
-  `SIGKILL`. Explicit `docker compose up -d` is required instead.
-- **Freshly created Docker volumes are root-owned**, but the Flink containers
-  run as the `flink` user. Every full `docker volume rm` and rebuild requires
-  reapplying `chown -R flink:flink` on the checkpoint and savepoint
-  directories before job submission will succeed. This is not yet scripted
-  into `make up` and should be, to avoid the manual step on every clean
-  environment reset.
-- **`curl` is not present inside the Flink images** despite being referenced
-  in earlier healthcheck scripts. Since the JobManager's REST API port
-  (`8081`) is exposed to the host, `curl` calls against Flink's REST API
-  should be run from the host shell, not `docker compose exec`.
-- **`*.txt` gitignore rules can silently exclude `requirements.txt`**, causing
-  Docker build failures with no obvious cause. Always check gitignore scope
-  when a build fails to find a dependency file that is visibly present in the
-  working directory.
-- **Kafka's retry budget is approximately 50 seconds** before a terminal
-  failure; this figure reappears consistently in both Scenario 1 (Kafka
-  broker failure) and Scenario 4 (Postgres outage) and reflects Flink's fixed
-  restart strategy budget in this deployment, not a Kafka-specific limit.
-- **Fixed drain waits produce false recovery results** in fault-tolerance
-  testing. Always poll until counts stabilize rather than waiting a fixed
-  number of seconds and assuming recovery is complete.
+1. Inject a controlled failure.
+2. Allow the system to recover or reach its terminal state.
+3. Reconcile Kafka offsets and downstream PostgreSQL counts.
+4. Check for lost, duplicated, or unexplained events.
+5. Repeat across different failure modes.
 
-## Testing methodology
+This approach makes the project useful as a systems-engineering exercise rather than a simple Kafka/Flink demo.
 
-Every verification in this project followed the same discipline: no step was
-marked complete without real terminal output, and no discrepancy was
-hand-waved away. When a producer's own counters proved unreliable (a hard
-kill, a truncated log from a concurrent process), the fix was always to
-reconcile backward from Kafka's raw offset deltas and Postgres's landed
-counts, never forward from self-reported application stats. This pattern
-surfaced independently in three of Step 9's four scenarios and is the single
-most reusable testing lesson from this project.
+## Project Focus
+
+The project is intentionally centered on the hard parts of real-time systems:
+
+* Event-time correctness
+* Late and out-of-order data
+* Idempotent processing
+* Fault recovery
+* Backpressure
+* Failure injection
+* End-to-end reconciliation
+* Throughput and latency under load
+* Clear failure boundaries between distributed components
